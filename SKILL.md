@@ -82,9 +82,10 @@ python -m balatro4llm --compact batch "move-hand 1 2" "pick 2 1 2"
 
 ## Critical Balatro Mechanics & Agent Strategy
 
-### 1. Joker Ordering (Multiply AFTER Adding!)
-Jokers trigger **left to right** (`[1]` → `[N]`).
+### 1. Joker & Hand Ordering (Multiply AFTER Adding!)
+Jokers and held-in-hand cards trigger **left to right** (`[1]` → `[N]`).
 - Place **+Chips** and **+Mult** jokers on the **left** and **XMult** jokers (`X2`, `X3`, `X4`, Polychrome) on the **right**.
+- For held-in-hand triggers, place flat `+Mult` cards (e.g. Queens for `Shoot the Moon`, lowest card for `Raised Fist`) to the **left** of `Steel` (`X1.5`) cards using `move-hand`.
 - Check `Blueprint` (copies joker immediately to its **right**) and `Brainstorm` (copies joker `[1]` on the far **left**). Live compatibility is shown as `compat` / `INCOMPAT` (and uncopyable jokers show `no-copy` when you own Blueprint/Brainstorm).
 
 ### 2. Shop Availability Tags
@@ -100,11 +101,17 @@ Shop prices explicitly distinguish why an item cannot be bought as-is:
 ### 4. Deck Composition (`Deck Left`)
 - Always check the `Deck Left (N): S:.. H:.. C:.. D:.. | A:.. K:.. | Special: ...` line before discarding (avoid chasing dead suits/ranks!) and in the Shop (pick Jokers/Planets that match your actual deck composition).
 
-### 5. Economy & Interest
-- You earn **+$1 interest per $5 held** at end of round (capped at **$25** = +$5/round unless upgraded by Seed Money / Money Tree).
-- Cast `Temperance` / `The Hermit` *before* spending down cash.
+### 5. Economy, Interest & Survival Spending
+- You earn **+$1 interest per $5 held** at end of round (capped at **$25** = +$5/round unless upgraded by Seed Money / Money Tree). Cast `Temperance` / `The Hermit` *before* spending down cash.
+- **Break the `$25` floor to survive**: Before leaving Shop (especially Ante 3+), check `Next:` / `Boss:` targets against your conservative 4-hand output. If scoring looks tight or you still lack `XMult`, spend below `$25` (reroll, buy Planets/Tarots/Glass/Steel) rather than dying with unspent cash.
 
-### 6. Boss Blind Traps
+### 6. High-Stake & Mid-Game Build Discipline
+- **Slot budget (Ante 3+)**: Converge on **1 Chips + 1 scaling `+Mult` + 2 `XMult`** (at most **1** econ/utility slot). Replace flat early Jokers before the Ante 4–5 scaling cliff.
+- **Prefer small hands on Blue+ Stakes**: With `-1` discard, **Pair / High Card** builds (scaling `+Mult` + Chips + `XMult` + **Blue Seal** planet generation) are far more reliable than brittle 5-card Flushes/Straights and do not fight held-in-hand `Steel`/Queen/King cards for hand space.
+- **No greedy hand-burning**: Only trigger single-card first-hand utilities (`DNA`, `Sixth Sense`) when remaining hands comfortably clear the blind—never lose a round for a slow copy.
+- **Eternal & Skip discipline**: Never buy temporary flat-value `Eternal` Jokers (only Eternals strong enough for Ante 8). Rarely skip blinds on high stakes (each skip costs scaling, Blue Seals, and a shop) unless a Tag like early `Investment Tag (+$25)` clearly outweighs it.
+
+### 7. Boss Blind Traps
 Read `Blind: ... — <Effect>` before every hand:
 - **The Pillar**: Cards played earlier in this Ante are `(DEBUFF)`.
 - **Cerulean Bell**: One card is `(FORCED)` and must be included in `play` / `discard`.
@@ -112,7 +119,7 @@ Read `Blind: ... — <Effect>` before every hand:
 - **Verdant Leaf**: Debuffs all cards until you `sell-joker <idx>`.
 - **Face-down cards (`??`)**: Use `sort-hand rank` vs `sort-hand suit` to deduce hidden cards fairly.
 
-### 7. Error & Timeout Recovery
+### 8. Error & Timeout Recovery
 - If a command times out during a long animation, run `python -m balatro4llm state` (or pass `--wait-timeout 60`) before acting again.
 - If `batch` fails mid-sequence, read the printed current state (all prior steps already succeeded) and continue from there.
 - If `state` shows `[RUN / WIN_SCREEN]` (Ante 8 cleared), use `endless` to continue into Endless Mode, `start` / `new-run` to start a new run, or `main-menu` to return to the Main Menu.
