@@ -25,14 +25,26 @@ from balatro4llm.client import (
 
 def _add_action_subparsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     """Register all executable action subcommands (shared by root CLI and `batch` validator)."""
-    p_start = sub.add_parser("start", help="Start a new run")
-    p_start.add_argument("--deck", default=None, help="Deck key or name (e.g. b_red, 'Blue Deck')")
-    p_start.add_argument("--stake", type=int, default=1, help="Stake level 1..8 (default: 1 White Chip)")
+    p_start = sub.add_parser("start", aliases=["new-run"], help="Start a new run (from Main Menu, Win screen, or Game Over)")
+    p_start.add_argument("--deck", default=None, help="Deck key or name (e.g. b_red, 'Red Deck', '红色牌组')")
+    p_start.add_argument("--stake", default="1", help="Stake 1..8, 'max' (highest unlocked for deck), or name (e.g. green, 绿注)")
     p_start.add_argument("--seed", default=None, help="Optional run seed")
 
     sub.add_parser("continue", help="Continue saved run from main menu")
+    sub.add_parser("endless", help="Continue into Endless Mode from the Ante 8 Win screen")
     sub.add_parser("main-menu", help="Return to the main menu")
-    sub.add_parser("dismiss-overlay", help="Dismiss active overlay menu (e.g. continue Endless Mode after win)")
+    sub.add_parser("dismiss-overlay", help="Dismiss active overlay menu (pause/tutorial/win popup)")
+
+    p_speed = sub.add_parser(
+        "set-speed",
+        help="Set Balatro game speed multiplier (0.5, 1, 2, 4 native/saved; 8, 16 runtime turbo)",
+    )
+    p_speed.add_argument(
+        "speed",
+        type=float,
+        choices=(0.5, 1.0, 2.0, 4.0, 8.0, 16.0),
+        help="Speed multiplier: 0.5, 1, 2, 4, 8, or 16",
+    )
 
     sub.add_parser("select-blind", help="Select the current on-deck blind")
     sub.add_parser("skip-blind", help="Skip the current Small or Big blind for its Tag")
@@ -46,6 +58,14 @@ def _add_action_subparsers(sub: argparse._SubParsersAction[argparse.ArgumentPars
 
     p_sort = sub.add_parser("sort-hand", help="Sort hand by rank or suit")
     p_sort.add_argument("by", choices=("rank", "suit"), help="Sort criterion")
+
+    p_mj = sub.add_parser("move-joker", help="Move a single Joker from one 1-based slot to another")
+    p_mj.add_argument("from_idx", metavar="from", type=int, help="Current 1-based Joker slot")
+    p_mj.add_argument("to_idx", metavar="to", type=int, help="Target 1-based Joker slot")
+
+    p_mh = sub.add_parser("move-hand", help="Move a single hand card from one 1-based slot to another")
+    p_mh.add_argument("from_idx", metavar="from", type=int, help="Current 1-based hand slot")
+    p_mh.add_argument("to_idx", metavar="to", type=int, help="Target 1-based hand slot")
 
     p_rj = sub.add_parser("reorder-jokers", help="Reorder Jokers by specifying the new 1-based index permutation")
     p_rj.add_argument("order", nargs="+", type=int, help="Full 1-based permutation of current Joker slots (e.g. 1 2 4 3)")
@@ -76,7 +96,18 @@ def _add_action_subparsers(sub: argparse._SubParsersAction[argparse.ArgumentPars
     p_pack.add_argument("index", type=int, help="1-based index in Booster Packs")
 
     sub.add_parser("reroll", help="Reroll shop cards")
-    sub.add_parser("next-round", help="Leave shop and advance to Blind Select")
+    p_next = sub.add_parser("next-round", help="Leave shop and advance to Blind Select (or enter/skip directly)")
+    p_next_grp = p_next.add_mutually_exclusive_group()
+    p_next_grp.add_argument(
+        "--select",
+        action="store_true",
+        help="Leave shop and immediately select/enter the next blind",
+    )
+    p_next_grp.add_argument(
+        "--skip",
+        action="store_true",
+        help="Leave shop and immediately skip the next Small/Big blind for its Skip Tag",
+    )
 
     p_pick = sub.add_parser("pick", help="Pick a card from an open booster pack by 1-based index")
     p_pick.add_argument("index", type=int, help="1-based index in Booster Pack")
@@ -88,8 +119,10 @@ def _add_action_subparsers(sub: argparse._SubParsersAction[argparse.ArgumentPars
 def _namespace_to_action_spec(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     """Convert a parsed CLI action namespace into a `(mod_action_name, params)` pair."""
     cmd = args.command
-    if cmd == "start":
-        params: dict[str, Any] = {"stake": args.stake}
+    if cmd in ("start", "new-run"):
+        raw_stake = str(args.stake).strip()
+        stake_val: int | str = int(raw_stake) if raw_stake.isdigit() else raw_stake
+        params: dict[str, Any] = {"stake": stake_val}
         if args.deck:
             params["deck"] = args.deck
         if args.seed:
@@ -97,10 +130,15 @@ def _namespace_to_action_spec(args: argparse.Namespace) -> tuple[str, dict[str, 
         return "start", params
     if cmd == "continue":
         return "continue", {}
+    if cmd == "endless":
+        return "endless", {}
     if cmd == "main-menu":
         return "main_menu", {}
     if cmd == "dismiss-overlay":
         return "dismiss_overlay", {}
+    if cmd == "set-speed":
+        spd = float(args.speed)
+        return "set_speed", {"speed": int(spd) if spd.is_integer() else spd}
     if cmd == "select-blind":
         return "select_blind", {}
     if cmd == "skip-blind":
@@ -113,6 +151,10 @@ def _namespace_to_action_spec(args: argparse.Namespace) -> tuple[str, dict[str, 
         return "discard", {"cards": list(args.cards)}
     if cmd == "sort-hand":
         return "sort_hand", {"by": args.by}
+    if cmd == "move-joker":
+        return "move_joker", {"from": args.from_idx, "to": args.to_idx}
+    if cmd == "move-hand":
+        return "move_hand", {"from": args.from_idx, "to": args.to_idx}
     if cmd == "reorder-jokers":
         return "reorder_jokers", {"order": list(args.order)}
     if cmd == "reorder-hand":
@@ -137,7 +179,12 @@ def _namespace_to_action_spec(args: argparse.Namespace) -> tuple[str, dict[str, 
     if cmd == "reroll":
         return "reroll", {}
     if cmd == "next-round":
-        return "next_round", {}
+        p_nr: dict[str, Any] = {}
+        if getattr(args, "select", False):
+            p_nr["select"] = True
+        elif getattr(args, "skip", False):
+            p_nr["skip"] = True
+        return "next_round", p_nr
     if cmd == "pick":
         p = {"index": args.index}
         if args.targets:
@@ -247,6 +294,12 @@ def _print_state_output(
             out["auto_steps"] = list(auto_steps)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
+    if receipt and receipt.get("action") == "set_speed":
+        prev_s = receipt.get("previous_speed", "?")
+        new_s = receipt.get("speed", "?")
+        persisted = receipt.get("persisted")
+        note = "saved" if persisted else "runtime-only turbo"
+        print(f"[speed] {prev_s:g}x -> {new_s:g}x ({note})" if isinstance(prev_s, (int, float)) and isinstance(new_s, (int, float)) else f"[speed] {prev_s}x -> {new_s}x ({note})")
     print(
         format_state(
             state,
@@ -271,15 +324,30 @@ def cmd_ping(client: BalatroClient, as_json: bool) -> int:
 
     stage_name = data.get("stage_name") or str(data.get("stage"))
     state_name = data.get("state_name") or str(data.get("state"))
+    gs = data.get("gamespeed")
+    gs_str = f"{float(gs):g}x" if isinstance(gs, (int, float)) else "?"
     print(f"PONG from balatro4llm v{data.get('mod_version')} ({rtt_ms:.1f} ms)")
     print(f"  Game Version : {data.get('game_version')}")
     print(f"  Stage / State: {stage_name} ({data.get('stage')}) / {state_name} ({data.get('state')})")
     print(f"  State Ready  : {data.get('state_complete')} | Paused: {data.get('paused')}")
+    print(f"  Game Speed   : {gs_str}")
     print(f"  FPS / Uptime : {data.get('fps')} fps / {data.get('uptime', 0):.1f}s")
     return 0
 
 
+def _configure_utf8_stdio() -> None:
+    """Force UTF-8 stdout/stderr so Windows shells/pipes never emit GBK mojibake."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     client = BalatroClient(host=args.host, port=args.port, timeout=args.timeout)
@@ -325,11 +393,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_select_boss=auto_select_boss,
         )
         auto_steps = receipt.get("auto_steps")
+        b_steps = receipt.get("batch_steps")
         _print_state_output(
             state,
             args.as_json,
             compact=compact,
             receipt=receipt,
+            batch_steps=b_steps,
             auto_steps=auto_steps,
         )
         return 0
