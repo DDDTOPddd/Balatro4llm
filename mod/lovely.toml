@@ -1,0 +1,73 @@
+[manifest]
+version = "0.4.0"
+dump_lua = true
+priority = 0
+
+[[patches]]
+[patches.module]
+source = "json.lua"
+before = "main.lua"
+name = "balatro4llm_json"
+
+[[patches]]
+[patches.module]
+source = "server.lua"
+before = "main.lua"
+name = "balatro4llm_server"
+
+[[patches]]
+[patches.module]
+source = "state.lua"
+before = "main.lua"
+name = "balatro4llm_state"
+
+[[patches]]
+[patches.module]
+source = "actions.lua"
+before = "main.lua"
+name = "balatro4llm_actions"
+
+[[patches]]
+[patches.module]
+source = "init.lua"
+before = "main.lua"
+name = "balatro4llm_init"
+
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "love.mouse.setVisible(false)"
+position = "after"
+match_indent = true
+times = 1
+payload = '''
+local _b4l_ok, _b4l_mod = pcall(require, "balatro4llm_init")
+if _b4l_ok and _b4l_mod then
+    _G.BALATRO4LLM = _b4l_mod
+    _b4l_mod.init()
+else
+    print("[balatro4llm] ERROR failed to require balatro4llm_init: " .. tostring(_b4l_mod))
+end
+'''
+
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "G:update(dt)"
+position = "after"
+match_indent = true
+times = 1
+payload = '''
+if _G.BALATRO4LLM then _G.BALATRO4LLM.update(dt) end
+'''
+
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "if G.STEAM then G.STEAM:shutdown() end"
+position = "after"
+match_indent = true
+times = 1
+payload = '''
+if _G.BALATRO4LLM then _G.BALATRO4LLM.quit() end
+'''
