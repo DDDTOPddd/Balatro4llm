@@ -6,7 +6,7 @@ local state_mod = require("balatro4llm_state")
 local actions_mod = require("balatro4llm_actions")
 
 local M = {
-    VERSION = "0.7.0",
+    VERSION = "0.8.0",
     _initialized = false,
 }
 

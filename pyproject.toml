@@ -4,17 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "balatro4llm"
-version = "0.7.0"
-description = "Lua Mod + CLI (+ future MCP) bridge for AI Agents to play Balatro"
+version = "0.8.0"
+description = "Lua Mod + CLI + MCP Server bridge for AI Agents to play Balatro"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp>=2.0"]
 
 [project.scripts]
-balatro-cli = "balatro4llm.cli:main"
+balatro-cli = "balatro4llm.cli.main:main"
+balatro-mcp = "balatro4llm.mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["balatro4llm*"]
