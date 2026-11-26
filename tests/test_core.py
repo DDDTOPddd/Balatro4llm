@@ -1,16 +1,25 @@
-"""Unit tests for v0.7.0 P0 optimizations (compact formatting, Shop blind preview, next-round --select/--skip, hand counts, turbo speed)."""
+"""Core unit tests for balatro4llm (formatting, action parsing, persistent TCP & auto-reconnect, batch)."""
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import socket
+import threading
 import unittest
 from typing import Any
 
-from balatro4llm.cli import build_parser, _namespace_to_action_spec, parse_batch_steps
-from balatro4llm.client import (
+from balatro4llm.cli import build_parser, namespace_to_action_spec, parse_batch_steps
+from balatro4llm.core import (
+    BalatroBatchError,
     BalatroClient,
+    BalatroCommandError,
     BalatroError,
     compute_legal_actions,
+    format_batch_error,
     format_state,
+    parse_action_command,
 )
 
 
@@ -185,35 +194,27 @@ def _sample_shop_state(
     }
 
 
-class TestP0FormattingAndCli(unittest.TestCase):
+class TestCoreFormatting(unittest.TestCase):
     def test_compact_shop_compresses_owned_consumables_tags_and_actions(self) -> None:
         st = _sample_shop_state()
         out = format_state(st, compact=True)
 
-        # Single-line owned consumables without long Chinese description
         self.assertIn("Consumables (2/2): [1]Strength(no-use,sell:$1) | [2]Venus(3oaK,usable,sell:$1)", out)
         self.assertNotIn("将最多2张 选定卡牌 点数提高1", out)
-        # Shop cards keep full description
         self.assertIn("将靠左牌变成靠右牌", out)
 
-        # Single-line compact Active Tags without Chinese descriptions
         self.assertIn("Active Tags: Investment Tag(+$25), Coupon Tag", out)
         self.assertNotIn("击败 Boss盲注后 获得$25", out)
 
-        # Shop Next Blind & Boss preview resolves stale on_deck="Small" -> Big
         self.assertIn("Next: [Big] Big Blind (52,500, $4 | Skip: Coupon Tag — 下一家店免费)", out)
         self.assertIn("Boss: The Ox (70,000, $5) — 打出三条牌型时 资金归$0", out)
 
-        # Supernova fallback stats + Upgraded Hands played count + Played Hands line
         self.assertIn("[1]Supernova(3oaK:+9M/Pair:+3M,sell:$2)", out)
         self.assertIn("Three of a Kind Lv.5 (110x11, x9)", out)
-        self.assertIn("Four of a Kind Lv.6 (210x22)", out)  # played=0 omits x0
+        self.assertIn("Four of a Kind Lv.6 (210x22)", out)
         self.assertIn("Played Hands: Three of a Kind:9, Pair:3, Full House:2", out)
 
-        # Probability indicator when > 1
         self.assertIn("Prob:2x", out)
-
-        # Terse Actions line in compact mode
         self.assertIn("Actions: reroll($5) | next-round [--select|--skip] | sell-joker | move-joker | use | sell-consumable", out)
         self.assertNotIn("Legal Actions:", out)
 
@@ -222,7 +223,6 @@ class TestP0FormattingAndCli(unittest.TestCase):
         out = format_state(st, compact=True)
         self.assertIn("Next: [Boss] The Ox (70,000, $5) — 打出三条牌型时 资金归$0", out)
         self.assertNotIn("\nBoss:", out)
-        # Cannot skip Boss, so only --select is advertised
         self.assertIn("next-round [--select]", out)
         self.assertNotIn("--skip", out)
 
@@ -232,7 +232,6 @@ class TestP0FormattingAndCli(unittest.TestCase):
         st["consumeables"]["cards"][0]["can_use_with_targets"] = True
         st["hand"] = {"limit": 8, "sort": "desc", "cards": [{"index": 1, "short": "AS"}, {"index": 2, "short": "KS"}]}
         out = format_state(st, compact=True)
-        # In hand focus, omit sell cost and show compact use:1..2
         self.assertIn("Consumables (2/2): [1]Strength(use:1..2) | [2]Venus(3oaK,usable)", out)
         self.assertIn("Actions: play | discard | sort-hand | move-hand | sell-joker | move-joker | use | sell-consumable", out)
 
@@ -242,33 +241,8 @@ class TestP0FormattingAndCli(unittest.TestCase):
         self.assertIn("将最多2张 选定卡牌 点数提高1", out)
         self.assertIn("Legal Actions:", out)
         self.assertIn("sell-joker <idx>", out)
-        # Default compute_legal_actions(compact=False) preserves full strings
         actions = compute_legal_actions(st)
         self.assertIn("sell-joker <idx>", actions)
-
-    def test_cli_parsers_for_speed_16_and_next_round_flags(self) -> None:
-        parser = build_parser()
-
-        ns16 = parser.parse_args(["set-speed", "16"])
-        self.assertEqual(_namespace_to_action_spec(ns16), ("set_speed", {"speed": 16}))
-
-        ns_sel = parser.parse_args(["next-round", "--select"])
-        self.assertEqual(_namespace_to_action_spec(ns_sel), ("next_round", {"select": True}))
-
-        ns_skip = parser.parse_args(["next-round", "--skip"])
-        self.assertEqual(_namespace_to_action_spec(ns_skip), ("next_round", {"skip": True}))
-
-        steps = parse_batch_steps(["buy 2 --use", "next-round --select"])
-        self.assertEqual(steps, [("buy", {"index": 2, "use": True}), ("next_round", {"select": True})])
-
-        ns_start_num = parser.parse_args(["start", "--deck", "b_red", "--stake", "3"])
-        self.assertEqual(_namespace_to_action_spec(ns_start_num), ("start", {"deck": "b_red", "stake": 3}))
-
-        ns_start_max = parser.parse_args(["start", "--deck", "红色牌组", "--stake", "max"])
-        self.assertEqual(_namespace_to_action_spec(ns_start_max), ("start", {"deck": "红色牌组", "stake": "max"}))
-
-        ns_start_name = parser.parse_args(["start", "--deck", "Red Deck", "--stake", "green"])
-        self.assertEqual(_namespace_to_action_spec(ns_start_name), ("start", {"deck": "Red Deck", "stake": "green"}))
 
     def test_main_menu_shows_all_stakes_and_per_deck_unlocked_ranges(self) -> None:
         menu_state = {
@@ -300,14 +274,45 @@ class TestP0FormattingAndCli(unittest.TestCase):
         self.assertIn("[3] 绿注 (Green Stake) — 所需分数增速加快", full_out)
         self.assertIn("b_red(红色牌组 (Red Deck), 1..3:Green)", full_out)
 
-    def test_expand_action_steps_and_next_round_composite(self) -> None:
-        expanded = BalatroClient._expand_action_steps([
-            ("buy", {"index": 1, "use": True}),
-            ("next_round", {"select": True}),
-        ])
+
+class TestCoreActionParsers(unittest.TestCase):
+    def test_parse_action_command_all_variants(self) -> None:
+        self.assertEqual(
+            parse_action_command('start --deck "Red Deck" --stake max --seed ABCD'),
+            ("start", {"deck": "Red Deck", "stake": "max", "seed": "ABCD"}),
+        )
+        self.assertEqual(parse_action_command("new-run --stake 3"), ("start", {"stake": 3}))
+        self.assertEqual(parse_action_command("set-speed 16"), ("set_speed", {"speed": 16}))
+        self.assertEqual(parse_action_command("set-speed 0.5"), ("set_speed", {"speed": 0.5}))
+        self.assertEqual(parse_action_command("move-joker 1 5"), ("move_joker", {"from": 1, "to": 5}))
+        self.assertEqual(parse_action_command("move-hand 4 2"), ("move_hand", {"from": 4, "to": 2}))
+        self.assertEqual(parse_action_command("buy 2 --use"), ("buy", {"index": 2, "use": True}))
+        self.assertEqual(parse_action_command("next-round --select"), ("next_round", {"select": True}))
+        self.assertEqual(parse_action_command("next-round --skip"), ("next_round", {"skip": True}))
+        self.assertEqual(parse_action_command("pick 2 1 3"), ("pick", {"index": 2, "targets": [1, 3]}))
+
+    def test_invalid_command_raises_silently_without_stderr_leak(self) -> None:
+        stderr_buf = io.StringIO()
+        stdout_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf), contextlib.redirect_stdout(stdout_buf):
+            for bad in ("", "   ", "nonexistent-cmd", "play", 'unterminated "quote', "next-round --select --skip"):
+                with self.assertRaises(BalatroError):
+                    parse_action_command(bad)
+        self.assertEqual(stderr_buf.getvalue(), "")
+        self.assertEqual(stdout_buf.getvalue(), "")
+
+    def test_cli_parsers_and_expand_steps(self) -> None:
+        parser = build_parser()
+        ns16 = parser.parse_args(["set-speed", "16"])
+        self.assertEqual(namespace_to_action_spec(ns16), ("set_speed", {"speed": 16}))
+
+        steps = parse_batch_steps(["buy 2 --use", "next-round --select"])
+        self.assertEqual(steps, [("buy", {"index": 2, "use": True}), ("next_round", {"select": True})])
+
+        expanded = BalatroClient._expand_action_steps(steps)
         self.assertEqual(
             expanded,
-            [("buy", {"index": 1, "use": True}), ("next_round", {}), ("select_blind", {})],
+            [("buy", {"index": 2, "use": True}), ("next_round", {}), ("select_blind", {})],
         )
 
         expanded_skip = BalatroClient._expand_action_steps([("next_round", {"skip": True})])
@@ -346,7 +351,7 @@ class _FakeClient(BalatroClient):
         return self._states.pop(0)
 
 
-class TestCompositeNextRoundExecution(unittest.TestCase):
+class TestCompositeAndPersistentTcp(unittest.TestCase):
     def test_next_round_select_executes_two_steps(self) -> None:
         client = _FakeClient()
         receipt, state = client.next_round(select=True, auto_cash_out=True, auto_select_boss=True)
@@ -358,6 +363,108 @@ class TestCompositeNextRoundExecution(unittest.TestCase):
         client = _FakeClient()
         with self.assertRaises(BalatroError):
             client.next_round(select=True, wait=False)
+
+    def test_persistent_connection_reuse_reconnect_and_batch_fail_fast(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(8)
+        stop_evt = threading.Event()
+        metrics = {"accepts": 0, "requests": 0}
+        force_drop_next = {"flag": False}
+        fail_buy = {"flag": False}
+        active_conns: list[socket.socket] = []
+
+        def handle_conn(conn: socket.socket) -> None:
+            buf = b""
+            with conn:
+                while not stop_evt.is_set():
+                    try:
+                        chunk = conn.recv(4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        if force_drop_next["flag"]:
+                            force_drop_next["flag"] = False
+                            return  # abrupt EOF before response to simulate game restart
+                        req = json.loads(line.decode("utf-8"))
+                        metrics["requests"] += 1
+                        cmd = req["cmd"]
+                        args = req.get("args") or {}
+                        if cmd == "ping":
+                            resp = {"id": req["id"], "ok": True, "data": {"mod_version": "0.7.0", "gamespeed": 4}}
+                        elif cmd == "state":
+                            resp = {"id": req["id"], "ok": True, "data": _sample_shop_state()}
+                        elif cmd == "action":
+                            act = args.get("name")
+                            if act == "buy" and fail_buy["flag"]:
+                                resp = {"id": req["id"], "ok": False, "error": "insufficient funds"}
+                            else:
+                                resp = {"id": req["id"], "ok": True, "data": {"action": act}}
+                        else:
+                            resp = {"id": req["id"], "ok": False, "error": "unknown"}
+                        conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+
+        def accept_loop() -> None:
+            srv.settimeout(0.1)
+            while not stop_evt.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                metrics["accepts"] += 1
+                active_conns.append(conn)
+                threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()
+
+        t = threading.Thread(target=accept_loop, daemon=True)
+        t.start()
+        try:
+            with BalatroClient(port=port, timeout=2.0, persistent=True) as client:
+                p = client.ping()
+                self.assertEqual(p["mod_version"], "0.7.0")
+                st1 = client.get_state()
+                self.assertEqual(st1["state_name"], "SHOP")
+                st2 = client.get_state()
+                self.assertEqual(st2["state_name"], "SHOP")
+                # All 3 calls shared 1 single keep-alive socket!
+                self.assertEqual(metrics["accepts"], 1)
+                self.assertEqual(metrics["requests"], 3)
+
+                # Simulate Balatro closing the idle socket; persistent client must reconnect transparently
+                force_drop_next["flag"] = True
+                st3 = client.get_state()
+                self.assertEqual(st3["state_name"], "SHOP")
+                self.assertEqual(metrics["accepts"], 2)
+
+                # Test batch fail-fast preserves completed steps and live state
+                fail_buy["flag"] = True
+                with self.assertRaises(BalatroBatchError) as ctx:
+                    client.run_batch([("reroll", {}), ("buy", {"index": 1})], wait_timeout=2.0)
+                self.assertEqual(ctx.exception.failed_index, 2)
+                self.assertEqual(ctx.exception.action_name, "buy")
+                self.assertEqual(len(ctx.exception.completed), 1)
+                self.assertEqual(ctx.exception.completed[0]["action"], "reroll")
+                self.assertIsNotNone(ctx.exception.last_state)
+                err_txt = format_batch_error(ctx.exception, compact=True)
+                self.assertIn("Completed before failure: reroll", err_txt)
+                self.assertIn("=== BALATRO [RUN / SHOP] ===", err_txt)
+        finally:
+            stop_evt.set()
+            for c in active_conns:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            srv.close()
+            t.join(timeout=1.0)
 
 
 if __name__ == "__main__":
