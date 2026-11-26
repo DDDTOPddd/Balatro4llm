@@ -16,9 +16,9 @@ Balatro (LÖVE2D + Lovely 0.10+)
                 │  NDJSON over TCP (127.0.0.1:12345)
                 ▼
 Python Layer (balatro4llm/)
-  ├── client.py            # Transport, stability wait loop, auto-advance, batching, state formatting
-  ├── cli.py               # Thin CLI entrypoint (`python -m balatro4llm ...`)
-  └── (future) mcp_server.py  # Drop-in wrapper over client.py with zero rework
+  ├── core/                # Zero-dependency shared core (errors, action registry, persistent TCP client, formatter)
+  ├── cli/                 # Thin CLI entrypoint (`balatro-cli` / `python -m balatro4llm ...`, zero extra deps)
+  └── mcp/                 # Optional MCPServer (`balatro-mcp` / `python -m balatro4llm.mcp`, via `.[mcp]`)
 ```
 
 ## Key Principles
@@ -52,11 +52,19 @@ Launch Balatro via Steam. Confirm Lovely's console logs:
 ```text
 [balatro4llm] Listening on 127.0.0.1:12345 (NDJSON/TCP)
 ```
-Then test from your terminal:
+Then test from your terminal (CLI requires zero third-party dependencies):
 ```powershell
 python -m balatro4llm ping
 python -m balatro4llm --compact state
 ```
+
+### 5. (Optional) Start as a Persistent MCP Server
+Install the optional `mcp` SDK extra once, then expose 4 lean tools (`balatro_ping`, `balatro_state`, `balatro_act`, `balatro_batch`) over `stdio` (or `streamable-http`) with persistent TCP keep-alive:
+```powershell
+pip install -e ".[mcp]"
+balatro-mcp --help
+```
+See [docs/mcp-setup.md](docs/mcp-setup.md) for DeepSeek Harness, Antigravity, Cursor, and Claude Desktop MCP configs.
 
 ## CLI Usage Examples
 
