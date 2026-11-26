@@ -413,6 +413,8 @@ local function serialize_playing_card(card, index, context)
     return entry
 end
 
+local joker_compact_stats
+
 local function serialize_item_card(card, index, context)
     local ab = card.ability or {}
     local center = card.config and card.config.center or {}
@@ -485,6 +487,12 @@ local function serialize_item_card(card, index, context)
     local ok_desc, desc = pcall(card_description, card)
     if ok_desc and desc then
         entry.description = desc
+    end
+    if set == "Joker" then
+        local cstats = joker_compact_stats(card)
+        if cstats then
+            entry.compact_stats = cstats
+        end
     end
 
     if ab.consumeable then
@@ -567,6 +575,200 @@ local function serialize_item_card(card, index, context)
     end
 
     return entry
+end
+
+joker_compact_stats = function(card)
+    local ok, res = pcall(function()
+        local ab = card.ability or {}
+        local name = ab.name
+        local parts = {}
+
+        if name == "Abstract Joker" then
+            local n = (G.jokers and G.jokers.cards) and #G.jokers.cards or 0
+            parts[#parts + 1] = "+" .. tostring(n * (ab.extra or 3)) .. "M"
+        elseif name == "Bull" then
+            local d = math.max(0, (G.GAME and G.GAME.dollars) or 0)
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 2) * d) .. "C"
+        elseif name == "Blue Joker" then
+            local n = (G.deck and G.deck.cards) and #G.deck.cards or 0
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 2) * n) .. "C"
+        elseif name == "Fortune Teller" then
+            local t = (G.GAME and G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.tarot) or 0
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 1) * t) .. "M"
+        elseif name == "Bootstraps" and type(ab.extra) == "table" then
+            local d = (G.GAME and G.GAME.dollars or 0) + (G.GAME and G.GAME.dollar_buffer or 0)
+            parts[#parts + 1] = "+" .. tostring((ab.extra.mult or 2) * math.floor(d / (ab.extra.dollars or 5))) .. "M"
+        elseif name == "Steel Joker" then
+            parts[#parts + 1] = "X" .. tostring(1 + (ab.extra or 0.2) * (ab.steel_tally or 0)) .. "M"
+        elseif name == "Stone Joker" then
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 25) * (ab.stone_tally or 0)) .. "C"
+        elseif name == "Erosion" then
+            local missing = G.playing_cards and math.max(0, (G.GAME.starting_deck_size or 52) - #G.playing_cards) or 0
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 4) * missing) .. "M"
+        elseif name == "Cloud 9" then
+            parts[#parts + 1] = "+$" .. tostring((ab.extra or 1) * (ab.nine_tally or 0))
+        elseif name == "Satellite" then
+            local p = 0
+            if G.GAME and G.GAME.consumeable_usage then
+                for _, v in pairs(G.GAME.consumeable_usage) do
+                    if v.set == "Planet" then p = p + 1 end
+                end
+            end
+            parts[#parts + 1] = "+$" .. tostring(p * (ab.extra or 1))
+        elseif name == "Runner" or name == "Ice Cream" or name == "Wee Joker" or name == "Square Joker" then
+            if type(ab.extra) == "table" and ab.extra.chips then
+                parts[#parts + 1] = "+" .. tostring(ab.extra.chips) .. "C"
+            end
+        elseif name == "Castle" and type(ab.extra) == "table" then
+            local cc = G.GAME and G.GAME.current_round and G.GAME.current_round.castle_card
+            local s = cc and SUIT_SHORT[cc.suit] or "?"
+            parts[#parts + 1] = s .. ":+" .. tostring(ab.extra.chips or 0) .. "C"
+        elseif name == "Mail-In Rebate" then
+            local mc = G.GAME and G.GAME.current_round and G.GAME.current_round.mail_card
+            local r = mc and (RANK_SHORT[mc.rank] or mc.rank) or "?"
+            parts[#parts + 1] = r .. ":+$" .. tostring(ab.extra or 5)
+        elseif name == "The Idol" then
+            local ic = G.GAME and G.GAME.current_round and G.GAME.current_round.idol_card
+            if ic then
+                parts[#parts + 1] = (RANK_SHORT[ic.rank] or ic.rank) .. (SUIT_SHORT[ic.suit] or "?") .. ":X" .. tostring(ab.extra or 2) .. "M"
+            end
+        elseif name == "Ancient Joker" then
+            local ac = G.GAME and G.GAME.current_round and G.GAME.current_round.ancient_card
+            local s = ac and SUIT_SHORT[ac.suit] or "?"
+            parts[#parts + 1] = s .. ":X" .. tostring(ab.extra or 1.5) .. "M"
+        elseif name == "To Do List" and type(ab.extra) == "table" then
+            local h = ab.to_do_poker_hand and localize(ab.to_do_poker_hand, "poker_hands") or "?"
+            if h == "ERROR" then h = ab.to_do_poker_hand or "?" end
+            parts[#parts + 1] = h .. ":+$" .. tostring(ab.extra.dollars or 4)
+        elseif name == "Loyalty Card" and type(ab.extra) == "table" then
+            if ab.loyalty_remaining == 0 then
+                parts[#parts + 1] = "ACTIVE X" .. tostring(ab.extra.Xmult or 4) .. "M"
+            else
+                parts[#parts + 1] = tostring(ab.loyalty_remaining) .. " left"
+            end
+        elseif name == "Invisible Joker" then
+            parts[#parts + 1] = tostring(ab.invis_rounds or 0) .. "/" .. tostring(ab.extra or 2)
+        elseif name == "Driver's License" then
+            parts[#parts + 1] = tostring(ab.driver_tally or 0) .. "/16"
+        elseif name == "Caino" then
+            parts[#parts + 1] = "X" .. tostring(ab.caino_xmult or 1) .. "M"
+        elseif name == "Yorick" then
+            parts[#parts + 1] = "X" .. tostring(ab.x_mult or 1) .. "M(" .. tostring(ab.yorick_discards or 0) .. "d)"
+        elseif name == "Golden Joker" then
+            parts[#parts + 1] = "+$" .. tostring(ab.extra or 4)
+        elseif name == "Rocket" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+$" .. tostring(ab.extra.dollars or 1)
+        elseif name == "Seltzer" then
+            parts[#parts + 1] = tostring(ab.extra or 0) .. "h"
+        elseif name == "Turtle Bean" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+" .. tostring(ab.extra.h_size or 0) .. "hand"
+        elseif name == "Misprint" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+" .. tostring(ab.extra.min or 0) .. "-" .. tostring(ab.extra.max or 23) .. "M"
+        elseif name == "Half Joker" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+" .. tostring(ab.extra.mult or 20) .. "M(<=" .. tostring(ab.extra.size or 3) .. ")"
+        elseif name == "Cavendish" or name == "Card Sharp" then
+            if type(ab.extra) == "table" and ab.extra.Xmult then
+                parts[#parts + 1] = "X" .. tostring(ab.extra.Xmult) .. "M"
+            end
+        elseif name == "Gros Michel" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+" .. tostring(ab.extra.mult or 15) .. "M"
+        elseif name == "Acrobat" or name == "Blackboard" or name == "Flower Pot" or name == "Seeing Double"
+            or name == "Photograph" or name == "Baron" or name == "Triboulet" or name == "Baseball Card" then
+            if type(ab.extra) == "number" then
+                parts[#parts + 1] = "X" .. tostring(ab.extra) .. "M"
+            end
+        else
+            if ab.t_chips and ab.t_chips > 0 then
+                parts[#parts + 1] = "+" .. tostring(ab.t_chips) .. "C"
+            end
+            if ab.t_mult and ab.t_mult > 0 then
+                parts[#parts + 1] = "+" .. tostring(ab.t_mult) .. "M"
+            end
+            if ab.mult and ab.mult > 0 then
+                parts[#parts + 1] = "+" .. tostring(ab.mult) .. "M"
+            end
+            if ab.x_mult and ab.x_mult > 1 then
+                parts[#parts + 1] = "X" .. tostring(ab.x_mult) .. "M"
+            end
+        end
+
+        if #parts == 0 then
+            return nil
+        end
+        return table.concat(parts, ",")
+    end)
+    if ok then
+        return res
+    end
+    return nil
+end
+
+local function serialize_deck_composition(cards)
+    local suits = { S = 0, H = 0, C = 0, D = 0, Stone = 0 }
+    local ranks = {
+        A = 0, K = 0, Q = 0, J = 0, ["10"] = 0,
+        ["9"] = 0, ["8"] = 0, ["7"] = 0, ["6"] = 0,
+        ["5"] = 0, ["4"] = 0, ["3"] = 0, ["2"] = 0,
+    }
+    local special_counts = {}
+
+    if type(cards) == "table" then
+        for _, card in ipairs(cards) do
+            local ab = card.ability or {}
+            local base = card.base or {}
+            local is_stone = (ab.effect == "Stone Card")
+            local short = "Stone"
+
+            if is_stone then
+                suits.Stone = suits.Stone + 1
+            else
+                local s = SUIT_SHORT[base.suit]
+                local r = RANK_SHORT[base.value]
+                if s and suits[s] ~= nil then
+                    suits[s] = suits[s] + 1
+                end
+                if r and ranks[r] ~= nil then
+                    ranks[r] = ranks[r] + 1
+                end
+                short = (r or "?") .. (s or "?")
+            end
+
+            local mods = {}
+            if ab.set == "Enhanced" and not is_stone then
+                mods[#mods + 1] = (ab.name or "Enh"):gsub(" Card$", "")
+            end
+            if card.edition and card.edition.type then
+                mods[#mods + 1] = card.edition.type
+            end
+            if card.seal then
+                mods[#mods + 1] = card.seal .. "Seal"
+            end
+            if ab.perma_bonus and ab.perma_bonus > 0 then
+                mods[#mods + 1] = "+" .. tostring(ab.perma_bonus) .. "c"
+            end
+
+            if is_stone or #mods > 0 then
+                local label = #mods > 0 and (short .. "(" .. table.concat(mods, ",") .. ")") or short
+                special_counts[label] = (special_counts[label] or 0) + 1
+            end
+        end
+    end
+
+    local special = json.array({})
+    local labels = {}
+    for lbl, _ in pairs(special_counts) do
+        labels[#labels + 1] = lbl
+    end
+    table.sort(labels)
+    for i, lbl in ipairs(labels) do
+        special[i] = { label = lbl, count = special_counts[lbl] }
+    end
+
+    return {
+        suits = suits,
+        ranks = ranks,
+        special = special,
+    }
 end
 
 local function serialize_cardarea(area, context, is_playing_area)
@@ -701,6 +903,16 @@ local function build_blind_info()
                 debuff_text = dt:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
             end
         end
+        local played_hands = nil
+        if b.name == "The Eye" and type(b.hands) == "table" then
+            played_hands = json.array({})
+            for hname, used in pairs(b.hands) do
+                if used then
+                    played_hands[#played_hands + 1] = hname
+                end
+            end
+            table.sort(played_hands)
+        end
         res.active = {
             key = bkey,
             type = b.get_type and b:get_type() or nil,
@@ -712,6 +924,7 @@ local function build_blind_info()
             disabled = b.disabled and true or false,
             triggered = b.triggered and true or false,
             debuff_text = debuff_text,
+            played_hands = played_hands,
         }
     end
 
@@ -970,6 +1183,7 @@ function M.get_state(_args)
                 total = G.playing_cards and #G.playing_cards or 0,
                 discarded = (G.discard and G.discard.cards) and #G.discard.cards or 0,
                 played = (G.play and G.play.cards) and #G.play.cards or 0,
+                composition = serialize_deck_composition(G.deck.cards),
             }
         end
 
