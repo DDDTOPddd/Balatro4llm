@@ -1,5 +1,5 @@
 [manifest]
-version = "0.5.0"
+version = "0.7.0"
 dump_lua = true
 priority = 0
 
@@ -70,4 +70,15 @@ match_indent = true
 times = 1
 payload = '''
 if _G.BALATRO4LLM then _G.BALATRO4LLM.quit() end
+'''
+
+[[patches]]
+[patches.pattern]
+target = "functions/UI_definitions.lua"
+pattern = "create_option_cycle({label = localize('b_set_gamespeed'),scale = 0.8, options = {0.5, 1, 2, 4}, opt_callback = 'change_gamespeed', current_option = (G.SETTINGS.GAMESPEED == 0.5 and 1 or G.SETTINGS.GAMESPEED == 4 and 4 or G.SETTINGS.GAMESPEED + 1)}),"
+position = "at"
+match_indent = true
+times = 1
+payload = '''
+create_option_cycle({label = localize('b_set_gamespeed'),scale = 0.8, options = {0.5, 1, 2, 4}, opt_callback = 'change_gamespeed', current_option = (G.SETTINGS.GAMESPEED == 0.5 and 1 or G.SETTINGS.GAMESPEED >= 4 and 4 or G.SETTINGS.GAMESPEED + 1)}),
 '''

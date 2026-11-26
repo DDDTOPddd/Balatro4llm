@@ -29,6 +29,21 @@ local SUIT_SHORT = {
     Diamonds = "D",
 }
 
+local HAND_SHORT = {
+    ["High Card"] = "HC",
+    ["Pair"] = "Pair",
+    ["Two Pair"] = "2Pair",
+    ["Three of a Kind"] = "3oaK",
+    ["Straight"] = "Straight",
+    ["Flush"] = "Flush",
+    ["Full House"] = "FullHouse",
+    ["Four of a Kind"] = "4oaK",
+    ["Straight Flush"] = "StrFlush",
+    ["Five of a Kind"] = "5oaK",
+    ["Flush House"] = "FlushHouse",
+    ["Flush Five"] = "Flush5",
+}
+
 local RARITY_NAME = {
     [1] = "Common",
     [2] = "Uncommon",
@@ -360,6 +375,49 @@ local function tag_description(tag_key, blind_slot, tag_obj)
     return nil
 end
 
+local function tag_compact_stats(tag_key, blind_slot, tag_obj)
+    local ok, res = pcall(function()
+        local proto = G.P_TAGS and G.P_TAGS[tag_key]
+        if not proto then
+            return nil
+        end
+        local cfg = (tag_obj and tag_obj.config) or proto.config or {}
+        local name = proto.name
+        if name == "Investment Tag" then
+            return "+$" .. tostring(cfg.dollars or 25)
+        elseif name == "Handy Tag" then
+            return "+$" .. tostring((cfg.dollars_per_hand or 1) * ((G.GAME and G.GAME.hands_played) or 0))
+        elseif name == "Garbage Tag" then
+            return "+$" .. tostring((cfg.dollars_per_discard or 1) * ((G.GAME and G.GAME.unused_discards) or 0))
+        elseif name == "Skip Tag" then
+            return "+$" .. tostring((cfg.skip_bonus or 5) * (((G.GAME and G.GAME.skips) or 0) + 1))
+        elseif name == "Economy Tag" then
+            return "x2<=$" .. tostring(cfg.max or 40)
+        elseif name == "Juggle Tag" then
+            return "+" .. tostring(cfg.h_size or 3) .. "hand"
+        elseif name == "Top-up Tag" then
+            return "+" .. tostring(cfg.spawn_jokers or 2) .. "jokers"
+        elseif name == "Orbital Tag" then
+            local hand_name = nil
+            if tag_obj and tag_obj.ability and tag_obj.ability.orbital_hand then
+                hand_name = tag_obj.ability.orbital_hand
+            elseif blind_slot and G.GAME and G.GAME.orbital_choices
+                and G.GAME.orbital_choices[G.GAME.round_resets.ante] then
+                hand_name = G.GAME.orbital_choices[G.GAME.round_resets.ante][blind_slot]
+            end
+            if hand_name then
+                return (HAND_SHORT[hand_name] or hand_name) .. "+" .. tostring(cfg.levels or 3)
+            end
+            return "+" .. tostring(cfg.levels or 3) .. "lv"
+        end
+        return nil
+    end)
+    if ok then
+        return res
+    end
+    return nil
+end
+
 local function serialize_playing_card(card, index, context)
     local face_down = (card.facing == "back")
     local ab = card.ability or {}
@@ -414,6 +472,7 @@ local function serialize_playing_card(card, index, context)
 end
 
 local joker_compact_stats
+local consumable_compact_stats
 
 local function serialize_item_card(card, index, context)
     local ab = card.ability or {}
@@ -493,9 +552,19 @@ local function serialize_item_card(card, index, context)
         if cstats then
             entry.compact_stats = cstats
         end
+        if center.blueprint_compat ~= nil then
+            entry.copyable = center.blueprint_compat and true or false
+        end
+        if ab.blueprint_compat == "compatible" or ab.blueprint_compat == "incompatible" then
+            entry.blueprint_compat = ab.blueprint_compat
+        end
     end
 
     if ab.consumeable then
+        local cstats = consumable_compact_stats(card)
+        if cstats then
+            entry.compact_stats = cstats
+        end
         local ok_use, can_use = pcall(function() return card:can_use_consumeable() end)
         entry.can_use = (ok_use and can_use) and true or false
         local max_h = ab.consumeable.max_highlighted
@@ -559,6 +628,8 @@ local function serialize_item_card(card, index, context)
             local is_neg = card.edition and card.edition.negative
             has_space = is_neg or (G.consumeables and (#G.consumeables.cards + (G.GAME.consumeable_buffer or 0) < G.consumeables.config.card_limit))
         end
+        entry.affordable = affordable and true or false
+        entry.has_space = has_space and true or false
         entry.can_buy = (affordable and has_space) and true or false
         if ab.consumeable then
             entry.can_buy_and_use = (affordable and entry.can_use) and true or false
@@ -577,15 +648,182 @@ local function serialize_item_card(card, index, context)
     return entry
 end
 
+consumable_compact_stats = function(card)
+    local ok, res = pcall(function()
+        local ab = card.ability or {}
+        local center = card.config and card.config.center or {}
+        local cfg = center.config or {}
+        local set = ab.set or center.set
+        local name = ab.name or center.name
+
+        if set == "Planet" then
+            local ht = (ab.consumeable and ab.consumeable.hand_type) or cfg.hand_type
+            if ht then
+                return HAND_SHORT[ht] or ht
+            end
+        elseif name == "The Fool" then
+            local last_key = G.GAME and G.GAME.last_tarot_planet
+            local fc = last_key and G.P_CENTERS and G.P_CENTERS[last_key]
+            if fc and fc.name then
+                return "->" .. fc.name
+            end
+            return "->none"
+        elseif name == "Temperance" then
+            local money = 0
+            if G.jokers and G.jokers.cards then
+                for _, j in ipairs(G.jokers.cards) do
+                    if j.ability and j.ability.set == "Joker" then
+                        money = money + (j.sell_cost or 0)
+                    end
+                end
+            end
+            return "+$" .. tostring(math.min(cfg.extra or 50, money))
+        elseif name == "The Hermit" then
+            local d = math.max(0, (G.GAME and G.GAME.dollars) or 0)
+            return "+$" .. tostring(math.min(cfg.extra or 20, d))
+        elseif name == "Ectoplasm" then
+            return "-" .. tostring((G.GAME and G.GAME.ecto_minus) or 1) .. "hand"
+        elseif name == "The Star" or name == "The Moon" or name == "The Sun" or name == "The World" then
+            local s = cfg.suit_conv and SUIT_SHORT[cfg.suit_conv]
+            if s then
+                return "->" .. s
+            end
+        end
+        return nil
+    end)
+    if ok then
+        return res
+    end
+    return nil
+end
+
 joker_compact_stats = function(card)
     local ok, res = pcall(function()
         local ab = card.ability or {}
         local name = ab.name
+        local cr = G.GAME and G.GAME.current_round or {}
+        local in_selecting = (G.STATE == G.STATES.SELECTING_HAND)
         local parts = {}
 
         if name == "Abstract Joker" then
             local n = (G.jokers and G.jokers.cards) and #G.jokers.cards or 0
             parts[#parts + 1] = "+" .. tostring(n * (ab.extra or 3)) .. "M"
+        elseif name == "Supernova" then
+            local played_list = {}
+            if G.GAME and G.GAME.hands then
+                for hname, h in pairs(G.GAME.hands) do
+                    if h.played and h.played > 0 then
+                        played_list[#played_list + 1] = { name = hname, played = h.played, order = h.order or 99 }
+                    end
+                end
+            end
+            table.sort(played_list, function(a, b)
+                if a.played ~= b.played then return a.played > b.played end
+                return a.order < b.order
+            end)
+            if #played_list == 0 then
+                parts[#parts + 1] = "+0M"
+            else
+                local top = {}
+                for i = 1, math.min(2, #played_list) do
+                    local it = played_list[i]
+                    top[#top + 1] = (HAND_SHORT[it.name] or it.name) .. ":+" .. tostring(it.played) .. "M"
+                end
+                parts[#parts + 1] = table.concat(top, "/")
+            end
+        elseif name == "Obelisk" then
+            parts[#parts + 1] = "X" .. tostring(ab.x_mult or 1) .. "M"
+            if G.GAME and G.GAME.hands then
+                local max_p = 0
+                for _, h in pairs(G.GAME.hands) do
+                    if h.visible and (h.played or 0) > max_p then
+                        max_p = h.played
+                    end
+                end
+                if max_p > 0 then
+                    local max_hands = {}
+                    for hname, h in pairs(G.GAME.hands) do
+                        if h.visible and (h.played or 0) == max_p then
+                            max_hands[#max_hands + 1] = { name = hname, order = h.order or 99 }
+                        end
+                    end
+                    table.sort(max_hands, function(a, b) return a.order < b.order end)
+                    local labels = {}
+                    for i = 1, math.min(3, #max_hands) do
+                        labels[#labels + 1] = HAND_SHORT[max_hands[i].name] or max_hands[i].name
+                    end
+                    parts[#parts + 1] = "avoid:" .. table.concat(labels, "/") .. "(" .. tostring(max_p) .. ")"
+                end
+            end
+        elseif name == "Card Sharp" then
+            local xm = (type(ab.extra) == "table" and ab.extra.Xmult) or 3
+            local armed = {}
+            if in_selecting and G.GAME and G.GAME.hands then
+                local list = {}
+                for hname, h in pairs(G.GAME.hands) do
+                    if (h.played_this_round or 0) > 0 then
+                        list[#list + 1] = { name = hname, order = h.order or 99 }
+                    end
+                end
+                table.sort(list, function(a, b) return a.order < b.order end)
+                for _, it in ipairs(list) do
+                    armed[#armed + 1] = HAND_SHORT[it.name] or it.name
+                end
+            end
+            if #armed > 0 then
+                parts[#parts + 1] = "X" .. tostring(xm) .. "M(on:" .. table.concat(armed, "/") .. ")"
+            else
+                parts[#parts + 1] = "X" .. tostring(xm) .. "M"
+            end
+        elseif name == "Banner" then
+            local dleft = cr.discards_left or 0
+            parts[#parts + 1] = "+" .. tostring((ab.extra or 30) * dleft) .. "C"
+        elseif name == "Mystic Summit" and type(ab.extra) == "table" then
+            local dleft = cr.discards_left or 0
+            local need = ab.extra.d_remaining or 0
+            if in_selecting and dleft == need then
+                parts[#parts + 1] = "ACTIVE:+" .. tostring(ab.extra.mult or 15) .. "M"
+            else
+                parts[#parts + 1] = "+" .. tostring(ab.extra.mult or 15) .. "M@" .. tostring(need) .. "d"
+            end
+        elseif name == "Acrobat" then
+            local xm = type(ab.extra) == "number" and ab.extra or 3
+            if in_selecting and (cr.hands_left or 0) == 1 then
+                parts[#parts + 1] = "ACTIVE:X" .. tostring(xm) .. "M"
+            else
+                parts[#parts + 1] = "X" .. tostring(xm) .. "M@last"
+            end
+        elseif name == "Dusk" then
+            if in_selecting and (cr.hands_left or 0) == 1 then
+                parts[#parts + 1] = "ACTIVE"
+            else
+                parts[#parts + 1] = "last-h"
+            end
+        elseif name == "Sixth Sense" or name == "DNA" then
+            if in_selecting then
+                parts[#parts + 1] = ((cr.hands_played or 0) == 0) and "READY" or "used"
+            end
+        elseif name == "Trading Card" or name == "Burnt Joker" then
+            if in_selecting then
+                parts[#parts + 1] = ((cr.discards_used or 0) == 0) and "READY" or "used"
+            end
+        elseif name == "Delayed Gratification" then
+            if (cr.discards_used or 0) == 0 then
+                parts[#parts + 1] = "+$" .. tostring((ab.extra or 2) * (cr.discards_left or 0))
+            else
+                parts[#parts + 1] = "$0"
+            end
+        elseif name == "Vagabond" then
+            local lim = ab.extra or 4
+            local d = (G.GAME and G.GAME.dollars) or 0
+            parts[#parts + 1] = (d <= lim) and "ACTIVE" or ("<=$" .. tostring(lim))
+        elseif name == "Luchador" then
+            local b = G.GAME and G.GAME.blind
+            if b and not b.disabled and b.get_type and b:get_type() == "Boss" then
+                parts[#parts + 1] = "BOSS-ACTIVE"
+            end
+        elseif name == "Stuntman" and type(ab.extra) == "table" then
+            parts[#parts + 1] = "+" .. tostring(ab.extra.chip_mod or 250) .. "C"
         elseif name == "Bull" then
             local d = math.max(0, (G.GAME and G.GAME.dollars) or 0)
             parts[#parts + 1] = "+" .. tostring((ab.extra or 2) * d) .. "C"
@@ -620,26 +858,25 @@ joker_compact_stats = function(card)
                 parts[#parts + 1] = "+" .. tostring(ab.extra.chips) .. "C"
             end
         elseif name == "Castle" and type(ab.extra) == "table" then
-            local cc = G.GAME and G.GAME.current_round and G.GAME.current_round.castle_card
+            local cc = cr.castle_card
             local s = cc and SUIT_SHORT[cc.suit] or "?"
             parts[#parts + 1] = s .. ":+" .. tostring(ab.extra.chips or 0) .. "C"
         elseif name == "Mail-In Rebate" then
-            local mc = G.GAME and G.GAME.current_round and G.GAME.current_round.mail_card
+            local mc = cr.mail_card
             local r = mc and (RANK_SHORT[mc.rank] or mc.rank) or "?"
             parts[#parts + 1] = r .. ":+$" .. tostring(ab.extra or 5)
         elseif name == "The Idol" then
-            local ic = G.GAME and G.GAME.current_round and G.GAME.current_round.idol_card
+            local ic = cr.idol_card
             if ic then
                 parts[#parts + 1] = (RANK_SHORT[ic.rank] or ic.rank) .. (SUIT_SHORT[ic.suit] or "?") .. ":X" .. tostring(ab.extra or 2) .. "M"
             end
         elseif name == "Ancient Joker" then
-            local ac = G.GAME and G.GAME.current_round and G.GAME.current_round.ancient_card
+            local ac = cr.ancient_card
             local s = ac and SUIT_SHORT[ac.suit] or "?"
             parts[#parts + 1] = s .. ":X" .. tostring(ab.extra or 1.5) .. "M"
         elseif name == "To Do List" and type(ab.extra) == "table" then
-            local h = ab.to_do_poker_hand and localize(ab.to_do_poker_hand, "poker_hands") or "?"
-            if h == "ERROR" then h = ab.to_do_poker_hand or "?" end
-            parts[#parts + 1] = h .. ":+$" .. tostring(ab.extra.dollars or 4)
+            local h = ab.to_do_poker_hand or "?"
+            parts[#parts + 1] = (HAND_SHORT[h] or h) .. ":+$" .. tostring(ab.extra.dollars or 4)
         elseif name == "Loyalty Card" and type(ab.extra) == "table" then
             if ab.loyalty_remaining == 0 then
                 parts[#parts + 1] = "ACTIVE X" .. tostring(ab.extra.Xmult or 4) .. "M"
@@ -647,9 +884,30 @@ joker_compact_stats = function(card)
                 parts[#parts + 1] = tostring(ab.loyalty_remaining) .. " left"
             end
         elseif name == "Invisible Joker" then
-            parts[#parts + 1] = tostring(ab.invis_rounds or 0) .. "/" .. tostring(ab.extra or 2)
+            local cur = ab.invis_rounds or 0
+            local req = ab.extra or 2
+            if cur >= req then
+                parts[#parts + 1] = "READY(" .. tostring(cur) .. "/" .. tostring(req) .. ")"
+            else
+                parts[#parts + 1] = tostring(cur) .. "/" .. tostring(req)
+            end
         elseif name == "Driver's License" then
-            parts[#parts + 1] = tostring(ab.driver_tally or 0) .. "/16"
+            local tally = ab.driver_tally or 0
+            if tally >= 16 then
+                parts[#parts + 1] = "X" .. tostring(ab.extra or 3) .. "M(" .. tostring(tally) .. "/16)"
+            else
+                parts[#parts + 1] = tostring(tally) .. "/16"
+            end
+        elseif name == "Joker Stencil" then
+            parts[#parts + 1] = "X" .. tostring(ab.x_mult or 0) .. "M"
+        elseif name == "Green Joker" or name == "Spare Trousers" or name == "Ride the Bus"
+            or name == "Red Card" or name == "Flash Card" or name == "Ceremonial Dagger"
+            or name == "Swashbuckler" or name == "Popcorn" then
+            parts[#parts + 1] = "+" .. tostring(ab.mult or 0) .. "M"
+        elseif name == "Constellation" or name == "Throwback" or name == "Glass Joker"
+            or name == "Hit the Road" or name == "Madness" or name == "Vampire"
+            or name == "Hologram" or name == "Lucky Cat" or name == "Campfire" or name == "Ramen" then
+            parts[#parts + 1] = "X" .. tostring(ab.x_mult or 1) .. "M"
         elseif name == "Caino" then
             parts[#parts + 1] = "X" .. tostring(ab.caino_xmult or 1) .. "M"
         elseif name == "Yorick" then
@@ -664,15 +922,21 @@ joker_compact_stats = function(card)
             parts[#parts + 1] = "+" .. tostring(ab.extra.h_size or 0) .. "hand"
         elseif name == "Misprint" and type(ab.extra) == "table" then
             parts[#parts + 1] = "+" .. tostring(ab.extra.min or 0) .. "-" .. tostring(ab.extra.max or 23) .. "M"
+        elseif name == "Blueprint" or name == "Brainstorm" then
+            if ab.blueprint_compat == "compatible" then
+                parts[#parts + 1] = "compat"
+            elseif ab.blueprint_compat == "incompatible" then
+                parts[#parts + 1] = "INCOMPAT"
+            end
         elseif name == "Half Joker" and type(ab.extra) == "table" then
             parts[#parts + 1] = "+" .. tostring(ab.extra.mult or 20) .. "M(<=" .. tostring(ab.extra.size or 3) .. ")"
-        elseif name == "Cavendish" or name == "Card Sharp" then
+        elseif name == "Cavendish" then
             if type(ab.extra) == "table" and ab.extra.Xmult then
                 parts[#parts + 1] = "X" .. tostring(ab.extra.Xmult) .. "M"
             end
         elseif name == "Gros Michel" and type(ab.extra) == "table" then
             parts[#parts + 1] = "+" .. tostring(ab.extra.mult or 15) .. "M"
-        elseif name == "Acrobat" or name == "Blackboard" or name == "Flower Pot" or name == "Seeing Double"
+        elseif name == "Blackboard" or name == "Flower Pot" or name == "Seeing Double"
             or name == "Photograph" or name == "Baron" or name == "Triboulet" or name == "Baseball Card" then
             if type(ab.extra) == "number" then
                 parts[#parts + 1] = "X" .. tostring(ab.extra) .. "M"
@@ -860,9 +1124,23 @@ local function build_ready_info(state_name)
         and (G.pack_cards.cards ~= nil)
         and (#G.pack_cards.cards > 0)
 
+    local is_win_screen = false
+    if G.OVERLAY_MENU and not G.OVERLAY_MENU.REMOVED then
+        if G.OVERLAY_MENU.get_UIE_by_ID then
+            local ok_w, win_ui = pcall(G.OVERLAY_MENU.get_UIE_by_ID, G.OVERLAY_MENU, "you_win_UI")
+            if ok_w and win_ui then
+                is_win_screen = true
+            end
+        end
+        if not is_win_screen and G.GAME and G.GAME.won and state_name == "ROUND_EVAL" then
+            is_win_screen = true
+        end
+    end
+
     return {
         paused = (G.SETTINGS and G.SETTINGS.paused) and true or false,
         has_overlay_menu = (G.OVERLAY_MENU ~= nil),
+        is_win_screen = is_win_screen,
         in_tutorial = (G.OVERLAY_TUTORIAL ~= nil),
         tutorial_complete = (G.SETTINGS and G.SETTINGS.tutorial_complete) and true or false,
         controller_locked = (G.CONTROLLER and G.CONTROLLER.locked) and true or false,
@@ -886,9 +1164,23 @@ local function build_blind_info()
         (uv["v_retcon"] and true or false)
         or ((uv["v_directors_cut"] and true or false) and not rr0.boss_rerolled)
     )
+    local on_deck = G.GAME and G.GAME.blind_on_deck or nil
+    if rr0.blind_states then
+        local bs = rr0.blind_states
+        local cur_st = on_deck and bs[on_deck]
+        if not on_deck or cur_st == "Defeated" or cur_st == "Skipped" or cur_st == "Hide" then
+            if bs.Small ~= "Defeated" and bs.Small ~= "Skipped" and bs.Small ~= "Hide" then
+                on_deck = "Small"
+            elseif bs.Big ~= "Defeated" and bs.Big ~= "Skipped" and bs.Big ~= "Hide" then
+                on_deck = "Big"
+            else
+                on_deck = "Boss"
+            end
+        end
+    end
     local res = {
         active = nil,
-        on_deck = G.GAME and G.GAME.blind_on_deck or nil,
+        on_deck = on_deck,
         can_reroll_boss = can_reroll_boss,
         choices = json.array({}),
     }
@@ -961,6 +1253,7 @@ local function build_blind_info()
                             name = tproto.name,
                             loc_name = safe_localize_name("Tag", tkey, tproto.name),
                             description = tag_description(tkey, slot, nil),
+                            compact_stats = tag_compact_stats(tkey, slot, nil),
                         }
                     end
                 end
@@ -983,33 +1276,76 @@ local function build_blind_info()
     return res
 end
 
+local function get_deck_stake_progress(deck_key, total_stakes)
+    local n_stakes = total_stakes or (G.P_CENTER_POOLS and G.P_CENTER_POOLS.Stake and #G.P_CENTER_POOLS.Stake) or 8
+    local profile = G.SETTINGS and G.SETTINGS.profile or 1
+    local all_unlocked = (G.PROFILES and G.PROFILES[profile] and G.PROFILES[profile].all_unlocked) and true or false
+    if all_unlocked then
+        return n_stakes, n_stakes
+    end
+    local win_stake = 0
+    if deck_key and get_deck_win_stake then
+        local ok, w = pcall(get_deck_win_stake, deck_key)
+        if ok and type(w) == "number" then
+            win_stake = w
+        end
+    end
+    local max_stake = math.min(win_stake + 1, n_stakes)
+    if max_stake < 1 then max_stake = 1 end
+    return win_stake, max_stake
+end
+
 local function build_menu_info()
     local profile = G.SETTINGS and G.SETTINGS.profile or 1
+    local all_unlocked = (G.PROFILES and G.PROFILES[profile] and G.PROFILES[profile].all_unlocked) and true or false
     local has_save = (G.SAVED_GAME ~= nil)
     if not has_save and love and love.filesystem and love.filesystem.getInfo then
         has_save = (love.filesystem.getInfo(profile .. "/save.jkr") ~= nil)
     end
+
+    local stakes = json.array({})
+    local stake_pool = G.P_CENTER_POOLS and G.P_CENTER_POOLS.Stake or {}
+    local n_stakes = #stake_pool > 0 and #stake_pool or 8
+    for i, sp in ipairs(stake_pool) do
+        stakes[i] = {
+            stake = i,
+            key = sp.key,
+            name = sp.name or ("Stake " .. tostring(i)),
+            loc_name = safe_localize_name("Stake", sp.key, sp.name or ("Stake " .. tostring(i))),
+            description = safe_raw_desc("Stake", sp.key, {}),
+        }
+    end
+
     local sel = G.GAME and G.GAME.selected_back
     local sel_key = sel and sel.effect and sel.effect.center and sel.effect.center.key or "b_red"
+    local sel_win, sel_max = get_deck_stake_progress(sel_key, n_stakes)
+
     local unlocked_decks = json.array({})
     if G.P_CENTER_POOLS and G.P_CENTER_POOLS.Back then
         for _, back in ipairs(G.P_CENTER_POOLS.Back) do
-            if back.unlocked then
+            if back.unlocked or all_unlocked then
+                local w, m = get_deck_stake_progress(back.key, n_stakes)
                 unlocked_decks[#unlocked_decks + 1] = {
                     key = back.key,
                     name = back.name,
                     loc_name = safe_localize_name("Back", back.key, back.name),
+                    win_stake = w,
+                    max_stake = m,
                 }
             end
         end
     end
     return {
         profile = profile,
+        all_unlocked = all_unlocked,
         has_saved_run = has_save,
+        stakes = stakes,
         selected_deck = {
             key = sel_key,
             name = (sel and sel.name) or "Red Deck",
             loc_name = (sel and sel.loc_name) or safe_localize_name("Back", sel_key, "Red Deck"),
+            win_stake = sel_win,
+            max_stake = sel_max,
         },
         unlocked_decks = unlocked_decks,
     }
@@ -1054,6 +1390,7 @@ local function build_run_info()
                     name = tag_obj.name,
                     loc_name = safe_localize_name("Tag", tag_obj.key, tag_obj.name),
                     description = tag_description(tag_obj.key, nil, tag_obj),
+                    compact_stats = tag_compact_stats(tag_obj.key, nil, tag_obj),
                 }
             end
         end
@@ -1136,6 +1473,7 @@ function M.get_state(_args)
         schema_version = M.SCHEMA_VERSION,
         game_version = G and G.VERSION or nil,
         language = G and G.SETTINGS and G.SETTINGS.language or nil,
+        gamespeed = G and G.SETTINGS and G.SETTINGS.GAMESPEED or 1,
         stage = stage,
         stage_name = stage_name,
         state = state,
@@ -1191,6 +1529,22 @@ function M.get_state(_args)
             out.round_eval = {
                 ready = ready.round_eval_ready,
                 cash_out_dollars = (G.GAME.current_round and G.GAME.current_round.dollars) or 0,
+            }
+        end
+
+        if ready.is_win_screen or state_name == "GAME_OVER" then
+            local rs = G.GAME.round_scores or {}
+            out.run_summary = {
+                won = G.GAME.won and true or false,
+                seed = G.GAME.pseudorandom and G.GAME.pseudorandom.seed or nil,
+                best_hand = rs.hand and rs.hand.amt or 0,
+                most_played_hand = G.GAME.current_round and G.GAME.current_round.most_played_poker_hand or nil,
+                cards_played = rs.cards_played and rs.cards_played.amt or 0,
+                cards_discarded = rs.cards_discarded and rs.cards_discarded.amt or 0,
+                cards_purchased = rs.cards_purchased and rs.cards_purchased.amt or 0,
+                times_rerolled = rs.times_rerolled and rs.times_rerolled.amt or 0,
+                furthest_ante = rs.furthest_ante and rs.furthest_ante.amt or (G.GAME.round_resets and G.GAME.round_resets.ante or 0),
+                furthest_round = rs.furthest_round and rs.furthest_round.amt or (G.GAME.round or 0),
             }
         end
 

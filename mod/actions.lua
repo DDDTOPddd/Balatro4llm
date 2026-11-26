@@ -55,15 +55,80 @@ local function resolve_deck_center(deck_spec)
     if G.P_CENTERS and G.P_CENTERS[deck_spec] and G.P_CENTERS[deck_spec].set == "Back" then
         return G.P_CENTERS[deck_spec], nil
     end
-    local lower = string.lower(tostring(deck_spec))
+    local raw = tostring(deck_spec):gsub("^%s+", ""):gsub("%s+$", "")
+    local lower = string.lower(raw)
     if G.P_CENTER_POOLS and G.P_CENTER_POOLS.Back then
         for _, back in ipairs(G.P_CENTER_POOLS.Back) do
-            if string.lower(back.key or "") == lower or string.lower(back.name or "") == lower then
+            local loc_name = nil
+            if localize then
+                local ok_l, res_l = pcall(localize, { type = "name_text", set = "Back", key = back.key })
+                if ok_l and type(res_l) == "string" and res_l ~= "" and res_l ~= "ERROR" then
+                    loc_name = res_l
+                end
+            end
+            if string.lower(back.key or "") == lower
+                or string.lower(back.name or "") == lower
+                or (loc_name and string.lower(loc_name) == lower) then
                 return back, nil
             end
         end
     end
     return nil, "unknown deck: " .. tostring(deck_spec)
+end
+
+local function get_deck_max_unlocked_stake(deck_key)
+    local stake_pool = G.P_CENTER_POOLS and G.P_CENTER_POOLS.Stake or {}
+    local n_stakes = #stake_pool > 0 and #stake_pool or 8
+    local profile = G.SETTINGS and G.SETTINGS.profile or 1
+    if G.PROFILES and G.PROFILES[profile] and G.PROFILES[profile].all_unlocked then
+        return n_stakes
+    end
+    local win_stake = 0
+    if deck_key and get_deck_win_stake then
+        local ok, w = pcall(get_deck_win_stake, deck_key)
+        if ok and type(w) == "number" then
+            win_stake = w
+        end
+    end
+    return math.max(1, math.min(win_stake + 1, n_stakes))
+end
+
+local function resolve_stake_level(stake_spec, max_unlocked)
+    local stake_pool = G.P_CENTER_POOLS and G.P_CENTER_POOLS.Stake or {}
+    local n_stakes = #stake_pool > 0 and #stake_pool or 8
+    if stake_spec == nil or stake_spec == "" then
+        return 1, nil
+    end
+    local num = tonumber(stake_spec)
+    if num ~= nil then
+        if math.floor(num) ~= num or num < 1 or num > n_stakes then
+            return nil, string.format("stake must be an integer between 1 and %d (or 'max' / stake name)", n_stakes)
+        end
+        return num, nil
+    end
+
+    local raw = tostring(stake_spec):gsub("^%s+", ""):gsub("%s+$", "")
+    local lower = string.lower(raw)
+    if lower == "max" or lower == "highest" or lower == "hardest" then
+        return max_unlocked, nil
+    end
+
+    for i, sp in ipairs(stake_pool) do
+        local key_l = string.lower(sp.key or "")
+        local name_l = string.lower(sp.name or "")
+        local short_l = name_l:gsub("%s+stake$", "")
+        local loc_l = nil
+        if localize then
+            local ok_l, res_l = pcall(localize, { type = "name_text", set = "Stake", key = sp.key })
+            if ok_l and type(res_l) == "string" and res_l ~= "" and res_l ~= "ERROR" then
+                loc_l = string.lower(res_l)
+            end
+        end
+        if lower == key_l or lower == name_l or lower == short_l or (loc_l and lower == loc_l) then
+            return i, nil
+        end
+    end
+    return nil, "unknown stake: " .. tostring(stake_spec) .. " (expected 1..8, 'max', or stake name like 'green')"
 end
 
 local function validate_hand_indices(raw_indices, min_count, max_count)
@@ -163,16 +228,14 @@ end
 -- === Action Handlers ===
 
 local function action_start(args)
-    local stake = tonumber(args.stake) or 1
-    if math.floor(stake) ~= stake or stake < 1 or stake > 8 then
-        return nil, "stake must be an integer between 1 and 8"
-    end
-
     local seed = args.seed
     if seed ~= nil then
         seed = tostring(seed)
         if seed == "" then seed = nil end
     end
+
+    local profile = G.SETTINGS and G.SETTINGS.profile or 1
+    local all_unlocked = (G.PROFILES and G.PROFILES[profile] and G.PROFILES[profile].all_unlocked) and true or false
 
     local center = nil
     if args.deck and args.deck ~= "" then
@@ -181,9 +244,30 @@ local function action_start(args)
         if not center then
             return nil, err
         end
-        if not center.unlocked then
+        if not center.unlocked and not all_unlocked then
             return nil, "deck is locked: " .. tostring(center.name)
         end
+    end
+
+    local active_deck_key = (center and center.key)
+        or (G.GAME and G.GAME.selected_back and G.GAME.selected_back.effect and G.GAME.selected_back.effect.center and G.GAME.selected_back.effect.center.key)
+        or "b_red"
+    local active_deck_name = (center and center.name)
+        or (G.GAME and G.GAME.selected_back and G.GAME.selected_back.name)
+        or active_deck_key
+    local max_unlocked = get_deck_max_unlocked_stake(active_deck_key)
+
+    local stake, stake_err = resolve_stake_level(args.stake, max_unlocked)
+    if not stake then
+        return nil, stake_err
+    end
+    if stake > max_unlocked then
+        local sp = G.P_CENTER_POOLS and G.P_CENTER_POOLS.Stake and G.P_CENTER_POOLS.Stake[stake]
+        local sname = (sp and sp.name) or ("Stake " .. tostring(stake))
+        return nil, string.format(
+            "stake %d (%s) is locked for deck '%s' (unlocked stakes: 1..%d)",
+            stake, sname, tostring(active_deck_name), max_unlocked
+        )
     end
 
     if G.OVERLAY_MENU and G.FUNCS.exit_overlay_menu then
@@ -202,8 +286,9 @@ local function action_start(args)
     G.FUNCS.start_run(nil, { stake = stake, seed = seed })
     return {
         action = "start",
-        deck = center and center.key or (G.GAME and G.GAME.selected_back and G.GAME.selected_back.name) or "default",
+        deck = active_deck_key,
         stake = stake,
+        max_unlocked_stake = max_unlocked,
         seed = seed,
     }
 end
@@ -238,6 +323,30 @@ local function action_main_menu(_args)
     end
     G.FUNCS.go_to_menu(nil)
     return { action = "main_menu" }
+end
+
+local function action_endless(_args)
+    if not G or G.STAGE ~= G.STAGES.RUN then
+        return nil, "not currently in a run"
+    end
+    if G.STATE == G.STATES.GAME_OVER then
+        return nil, "cannot enter endless mode from GAME_OVER"
+    end
+    if not G.OVERLAY_MENU then
+        return nil, "win overlay is not currently active"
+    end
+    local is_win = (G.GAME and G.GAME.won) and true or false
+    if G.OVERLAY_MENU.get_UIE_by_ID then
+        local ok_w, win_ui = pcall(G.OVERLAY_MENU.get_UIE_by_ID, G.OVERLAY_MENU, "you_win_UI")
+        if ok_w and win_ui then
+            is_win = true
+        end
+    end
+    if not is_win then
+        return nil, "current overlay is not the Ante 8 win screen; use dismiss_overlay instead"
+    end
+    G.FUNCS.exit_overlay_menu()
+    return { action = "endless" }
 end
 
 local function action_dismiss_overlay(_args)
@@ -381,6 +490,89 @@ local function action_sort_hand(args)
         return { action = "sort_hand", by = "suit" }
     end
     return nil, "invalid sort mode '" .. by .. "' (expected 'rank' or 'suit')"
+end
+
+local NATIVE_SPEEDS = {
+    [0.5] = true,
+    [1] = true,
+    [2] = true,
+    [4] = true,
+}
+
+local function action_set_speed(args)
+    local speed = tonumber(args.speed)
+    if not speed or (speed ~= 0.5 and speed ~= 1 and speed ~= 2 and speed ~= 4 and speed ~= 8 and speed ~= 16) then
+        return nil, "invalid speed: expected one of 0.5, 1, 2, 4, 8, 16"
+    end
+    if not G or not G.SETTINGS then
+        return nil, "G.SETTINGS is not initialized"
+    end
+    local prev = G.SETTINGS.GAMESPEED or 1
+    if G.FUNCS and G.FUNCS.change_gamespeed then
+        G.FUNCS.change_gamespeed({ to_val = speed })
+    else
+        G.SETTINGS.GAMESPEED = speed
+    end
+    -- Only persist native Options-menu values (0.5/1/2/4) to settings.jkr so UI_definitions.lua:2302 stays in-bounds.
+    if NATIVE_SPEEDS[speed] and G.save_settings then
+        pcall(G.save_settings, G)
+    end
+    return {
+        action = "set_speed",
+        previous_speed = prev,
+        speed = G.SETTINGS.GAMESPEED,
+        persisted = NATIVE_SPEEDS[speed] and true or false,
+    }
+end
+
+local function action_move_joker(args)
+    local ok, err = require_run_ready(nil, nil)
+    if not ok then return nil, err end
+    if not G.jokers or not G.jokers.cards or #G.jokers.cards < 2 then
+        return nil, "need at least 2 jokers to move"
+    end
+    local n = #G.jokers.cards
+    local from_idx = tonumber(args.from)
+    local to_idx = tonumber(args.to)
+    if not from_idx or math.floor(from_idx) ~= from_idx or from_idx < 1 or from_idx > n then
+        return nil, string.format("invalid 'from' index %s (expected 1..%d)", tostring(args.from), n)
+    end
+    if not to_idx or math.floor(to_idx) ~= to_idx or to_idx < 1 or to_idx > n then
+        return nil, string.format("invalid 'to' index %s (expected 1..%d)", tostring(args.to), n)
+    end
+    if from_idx ~= to_idx then
+        local card = table.remove(G.jokers.cards, from_idx)
+        table.insert(G.jokers.cards, to_idx, card)
+        G.jokers:align_cards()
+        G.jokers:set_ranks()
+        play_sound("cardSlide1")
+    end
+    return { action = "move_joker", from = from_idx, to = to_idx }
+end
+
+local function action_move_hand(args)
+    local ok, err = require_run_ready(nil, nil)
+    if not ok then return nil, err end
+    if not G.hand or not G.hand.cards or #G.hand.cards < 2 then
+        return nil, "need at least 2 hand cards to move"
+    end
+    local n = #G.hand.cards
+    local from_idx = tonumber(args.from)
+    local to_idx = tonumber(args.to)
+    if not from_idx or math.floor(from_idx) ~= from_idx or from_idx < 1 or from_idx > n then
+        return nil, string.format("invalid 'from' index %s (expected 1..%d)", tostring(args.from), n)
+    end
+    if not to_idx or math.floor(to_idx) ~= to_idx or to_idx < 1 or to_idx > n then
+        return nil, string.format("invalid 'to' index %s (expected 1..%d)", tostring(args.to), n)
+    end
+    if from_idx ~= to_idx then
+        local card = table.remove(G.hand.cards, from_idx)
+        table.insert(G.hand.cards, to_idx, card)
+        G.hand:align_cards()
+        G.hand:set_ranks()
+        play_sound("cardSlide1")
+    end
+    return { action = "move_hand", from = from_idx, to = to_idx }
 end
 
 local function action_reorder_jokers(args)
@@ -716,6 +908,7 @@ local ACTIONS = {
     start = action_start,
     continue = action_continue,
     main_menu = action_main_menu,
+    endless = action_endless,
     dismiss_overlay = action_dismiss_overlay,
     select_blind = action_select_blind,
     skip_blind = action_skip_blind,
@@ -723,6 +916,9 @@ local ACTIONS = {
     play = action_play,
     discard = action_discard,
     sort_hand = action_sort_hand,
+    set_speed = action_set_speed,
+    move_joker = action_move_joker,
+    move_hand = action_move_hand,
     reorder_jokers = action_reorder_jokers,
     reorder_hand = action_reorder_hand,
     sell_joker = action_sell_joker,
