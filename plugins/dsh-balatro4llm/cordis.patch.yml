@@ -1,0 +1,9 @@
+- insert:
+    - id: balatro4llm-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: balatro
+        transport: stdio
+        command: 'E:\anaconda3\Scripts\balatro-mcp.exe'
+        args: []
+        failOnStartupError: true

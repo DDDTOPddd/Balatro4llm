@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Balatro MCP bridge",
+    "description": "Starts the local balatro-mcp server over stdio and gives the agent four Balatro tools (balatro_ping, balatro_state, balatro_act, balatro_batch) plus the balatro://state and balatro://guide resources. Requires the balatro4llm MCP extra installed and the Balatro game running with its mod listening on 127.0.0.1:12345; while the game is closed, calls fail until it starts again, and tool calls also add their tool schemas to every request. Turn the plugin off in Plugins to remove the tools and that context cost."
+  }
+}

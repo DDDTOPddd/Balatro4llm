@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "小丑牌 MCP 桥接",
+    "description": "通过 stdio 拉起本机的 balatro-mcp，向 Agent 提供 4 个打牌工具（balatro_ping、balatro_state、balatro_act、balatro_batch）以及 balatro://state、balatro://guide 两个资源。前提是已安装 balatro4llm 的 MCP 依赖，并且《小丑牌》游戏内的 Mod 正在 127.0.0.1:12345 监听；游戏未启动时调用会失败，等游戏启动后自动恢复。工具已连接时其 Schema 会计入每次请求的上下文，不打牌时在「插件」里关闭本插件即可同步下线工具并释放这部分占用。"
+  }
+}

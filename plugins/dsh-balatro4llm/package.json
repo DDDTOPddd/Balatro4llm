@@ -1,0 +1,10 @@
+{
+  "name": "@local/balatro4llm",
+  "version": "0.8.0",
+  "private": true,
+  "description": "DeepSeek Harness bundle that connects the local balatro-mcp server over stdio.",
+  "type": "module",
+  "exports": { "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["cordis.patch.yml", "locale/*.json", "README.md", "icon.svg"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" role="img" aria-label="Balatro MCP bridge">
+  <rect x="9" y="9" width="11.5" height="17" rx="2.2" fill="none" stroke="#3d7fb8" stroke-width="2" transform="rotate(-14 14.75 17.5)"/>
+  <rect x="16" y="10" width="11.5" height="17" rx="2.2" fill="none" stroke="#c2504f" stroke-width="2"/>
+  <path d="M21.75 14.6l2.3 4.4-2.3 4.4-2.3-4.4z" fill="#c2504f"/>
+</svg>
