@@ -1,0 +1,71 @@
+"""Shared zero-dependency core for Balatro4llm CLI and MCP adapters."""
+
+from balatro4llm.core.actions import (
+    add_action_subparsers,
+    expand_action_steps,
+    namespace_to_action_spec,
+    parse_action_command,
+    parse_batch_steps,
+)
+from balatro4llm.core.client import (
+    BalatroClient,
+    DEFAULT_AUTO_ADVANCE,
+    DEFAULT_AUTO_CASH_OUT,
+    DEFAULT_COMPACT,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    PACK_STATES,
+    TRANSIENT_STATES,
+    is_state_stable,
+    is_win_screen,
+)
+from balatro4llm.core.errors import (
+    BalatroBatchError,
+    BalatroCommandError,
+    BalatroConnectionError,
+    BalatroError,
+    BalatroTimeoutError,
+)
+from balatro4llm.core.formatter import (
+    HAND_SHORT,
+    RANK_ORDER,
+    compute_legal_actions,
+    format_auto_steps,
+    format_batch_error,
+    format_deck_composition,
+    format_ping,
+    format_speed_receipt,
+    format_state,
+)
+
+__all__ = [
+    "BalatroBatchError",
+    "BalatroClient",
+    "BalatroCommandError",
+    "BalatroConnectionError",
+    "BalatroError",
+    "BalatroTimeoutError",
+    "DEFAULT_AUTO_ADVANCE",
+    "DEFAULT_AUTO_CASH_OUT",
+    "DEFAULT_COMPACT",
+    "DEFAULT_HOST",
+    "DEFAULT_PORT",
+    "HAND_SHORT",
+    "PACK_STATES",
+    "RANK_ORDER",
+    "TRANSIENT_STATES",
+    "add_action_subparsers",
+    "compute_legal_actions",
+    "expand_action_steps",
+    "format_auto_steps",
+    "format_batch_error",
+    "format_deck_composition",
+    "format_ping",
+    "format_speed_receipt",
+    "format_state",
+    "is_state_stable",
+    "is_win_screen",
+    "namespace_to_action_spec",
+    "parse_action_command",
+    "parse_batch_steps",
+]
