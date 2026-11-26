@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 import time
 from typing import Any, Sequence
 
 from balatro4llm.client import (
+    BalatroBatchError,
     BalatroClient,
     BalatroError,
+    DEFAULT_AUTO_ADVANCE,
+    DEFAULT_AUTO_CASH_OUT,
+    DEFAULT_COMPACT,
     DEFAULT_HOST,
     DEFAULT_PORT,
     compute_legal_actions,
@@ -18,25 +23,8 @@ from balatro4llm.client import (
 )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="balatro-cli",
-        description="CLI bridge to control Balatro via the in-game balatro4llm Lua Mod",
-    )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Mod host (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Mod port (default: {DEFAULT_PORT})")
-    parser.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5.0)")
-    parser.add_argument("--wait-timeout", type=float, default=30.0, help="Post-action stability wait timeout (default: 30.0s)")
-    parser.add_argument("--no-wait", action="store_true", help="Do not wait for animations to finish after an action")
-    parser.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("ping", help="Check connectivity to the in-game Mod")
-
-    p_state = sub.add_parser("state", help="Inspect current Balatro game state")
-    p_state.add_argument("--hands", action="store_true", help="Include full poker hand levels table")
-
+def _add_action_subparsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register all executable action subcommands (shared by root CLI and `batch` validator)."""
     p_start = sub.add_parser("start", help="Start a new run")
     p_start.add_argument("--deck", default=None, help="Deck key or name (e.g. b_red, 'Blue Deck')")
     p_start.add_argument("--stake", type=int, default=1, help="Stake level 1..8 (default: 1 White Chip)")
@@ -96,18 +84,178 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("skip-pack", help="Skip the current booster pack")
 
+
+def _namespace_to_action_spec(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    """Convert a parsed CLI action namespace into a `(mod_action_name, params)` pair."""
+    cmd = args.command
+    if cmd == "start":
+        params: dict[str, Any] = {"stake": args.stake}
+        if args.deck:
+            params["deck"] = args.deck
+        if args.seed:
+            params["seed"] = args.seed
+        return "start", params
+    if cmd == "continue":
+        return "continue", {}
+    if cmd == "main-menu":
+        return "main_menu", {}
+    if cmd == "dismiss-overlay":
+        return "dismiss_overlay", {}
+    if cmd == "select-blind":
+        return "select_blind", {}
+    if cmd == "skip-blind":
+        return "skip_blind", {}
+    if cmd == "reroll-boss":
+        return "reroll_boss", {}
+    if cmd == "play":
+        return "play", {"cards": list(args.cards)}
+    if cmd == "discard":
+        return "discard", {"cards": list(args.cards)}
+    if cmd == "sort-hand":
+        return "sort_hand", {"by": args.by}
+    if cmd == "reorder-jokers":
+        return "reorder_jokers", {"order": list(args.order)}
+    if cmd == "reorder-hand":
+        return "reorder_hand", {"order": list(args.order)}
+    if cmd == "sell-joker":
+        return "sell_joker", {"index": args.index}
+    if cmd == "sell-consumable":
+        return "sell_consumable", {"index": args.index}
+    if cmd == "use":
+        p: dict[str, Any] = {"index": args.index}
+        if args.targets:
+            p["targets"] = list(args.targets)
+        return "use", p
+    if cmd == "cash-out":
+        return "cash_out", {}
+    if cmd == "buy":
+        return "buy", {"index": args.index, "use": bool(args.use)}
+    if cmd == "buy-voucher":
+        return "buy_voucher", {"index": args.index}
+    if cmd == "buy-pack":
+        return "buy_pack", {"index": args.index}
+    if cmd == "reroll":
+        return "reroll", {}
+    if cmd == "next-round":
+        return "next_round", {}
+    if cmd == "pick":
+        p = {"index": args.index}
+        if args.targets:
+            p["targets"] = list(args.targets)
+        return "pick", p
+    if cmd == "skip-pack":
+        return "skip_pack", {}
+    raise BalatroError(f"Unsupported action command: {cmd}")
+
+
+def _build_action_only_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="batch-step", add_help=False, exit_on_error=False)
+    sub = p.add_subparsers(dest="command", required=True)
+    _add_action_subparsers(sub)
+    return p
+
+
+def parse_batch_steps(step_strings: Sequence[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Validate and parse every step string in a `batch` invocation before executing any action."""
+    step_parser = _build_action_only_parser()
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for i, raw in enumerate(step_strings, start=1):
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            raise BalatroError(f"Batch step #{i} syntax error ({raw!r}): {exc}") from exc
+        if not tokens:
+            raise BalatroError(f"Batch step #{i} is empty.")
+        try:
+            ns = step_parser.parse_args(tokens)
+        except (argparse.ArgumentError, SystemExit) as exc:
+            raise BalatroError(f"Batch step #{i} invalid command ({raw!r}): {exc}") from exc
+        parsed.append(_namespace_to_action_spec(ns))
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="balatro-cli",
+        description="CLI bridge to control Balatro via the in-game balatro4llm Lua Mod",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Mod host (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Mod port (default: {DEFAULT_PORT})")
+    parser.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5.0)")
+    parser.add_argument("--wait-timeout", type=float, default=30.0, help="Post-action stability wait timeout (default: 30.0s)")
+    parser.add_argument("--no-wait", action="store_true", help="Do not wait for animations to finish after an action")
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=DEFAULT_COMPACT,
+        help="Compact token-efficient text output (or set BALATRO4LLM_COMPACT=1)",
+    )
+    parser.add_argument(
+        "--auto-cash-out",
+        action="store_true",
+        default=DEFAULT_AUTO_CASH_OUT,
+        help="Automatically cash out when an action reaches ROUND_EVAL (or set BALATRO4LLM_AUTO_CASH_OUT=1)",
+    )
+    parser.add_argument(
+        "--auto-advance",
+        action="store_true",
+        default=DEFAULT_AUTO_ADVANCE,
+        help="Auto cash-out AND auto-select mandatory Boss Blind when it cannot be rerolled (or BALATRO4LLM_AUTO_ADVANCE=1)",
+    )
+    parser.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("ping", help="Check connectivity to the in-game Mod")
+
+    p_state = sub.add_parser("state", help="Inspect current Balatro game state")
+    p_state.add_argument("--hands", action="store_true", help="Include full poker hand levels table")
+
+    _add_action_subparsers(sub)
+
+    p_batch = sub.add_parser(
+        "batch",
+        help="Execute multiple deterministic actions in sequence, waiting until stable between steps",
+    )
+    p_batch.add_argument(
+        "steps",
+        nargs="+",
+        help='Quoted action commands, e.g. "reorder-jokers 1 2 3 5 4" "play 1 2 3 4 5"',
+    )
+
     return parser
 
 
-def _print_state_output(state: dict[str, Any], as_json: bool, *, receipt: dict[str, Any] | None = None, show_hands: bool = False) -> None:
+def _print_state_output(
+    state: dict[str, Any],
+    as_json: bool,
+    *,
+    compact: bool = False,
+    receipt: dict[str, Any] | None = None,
+    batch_steps: Sequence[dict[str, Any]] | None = None,
+    auto_steps: Sequence[dict[str, Any]] | None = None,
+    show_hands: bool = False,
+) -> None:
     if as_json:
         out: dict[str, Any] = dict(state)
         out["legal_actions"] = compute_legal_actions(state)
         if receipt is not None:
             out["action_receipt"] = receipt
+        if batch_steps is not None:
+            out["batch_results"] = list(batch_steps)
+        if auto_steps:
+            out["auto_steps"] = list(auto_steps)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
-    print(format_state(state, show_hands=show_hands))
+    print(
+        format_state(
+            state,
+            show_hands=show_hands,
+            compact=compact,
+            auto_steps=auto_steps,
+            batch_steps=batch_steps,
+        )
+    )
 
 
 def cmd_ping(client: BalatroClient, as_json: bool) -> int:
@@ -137,6 +285,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     client = BalatroClient(host=args.host, port=args.port, timeout=args.timeout)
     wait = not args.no_wait
     wt = args.wait_timeout
+    compact = bool(args.compact)
+    auto_cash_out = bool(args.auto_cash_out or args.auto_advance)
+    auto_select_boss = bool(args.auto_advance)
 
     try:
         cmd = args.command
@@ -144,60 +295,64 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_ping(client, as_json=args.as_json)
         if cmd == "state":
             state = client.get_state()
-            _print_state_output(state, args.as_json, show_hands=args.hands)
+            _print_state_output(state, args.as_json, compact=compact, show_hands=args.hands)
             return 0
 
-        if cmd == "start":
-            receipt, state = client.start_run(deck=args.deck, stake=args.stake, seed=args.seed, wait=wait, wait_timeout=wt)
-        elif cmd == "continue":
-            receipt, state = client.continue_run(wait=wait, wait_timeout=wt)
-        elif cmd == "main-menu":
-            receipt, state = client.go_to_menu(wait=wait, wait_timeout=wt)
-        elif cmd == "dismiss-overlay":
-            receipt, state = client.dismiss_overlay(wait=wait, wait_timeout=wt)
-        elif cmd == "select-blind":
-            receipt, state = client.select_blind(wait=wait, wait_timeout=wt)
-        elif cmd == "skip-blind":
-            receipt, state = client.skip_blind(wait=wait, wait_timeout=wt)
-        elif cmd == "reroll-boss":
-            receipt, state = client.reroll_boss(wait=wait, wait_timeout=wt)
-        elif cmd == "play":
-            receipt, state = client.play(args.cards, wait=wait, wait_timeout=wt)
-        elif cmd == "discard":
-            receipt, state = client.discard(args.cards, wait=wait, wait_timeout=wt)
-        elif cmd == "sort-hand":
-            receipt, state = client.sort_hand(args.by, wait=wait, wait_timeout=wt)
-        elif cmd == "reorder-jokers":
-            receipt, state = client.reorder_jokers(args.order, wait=wait, wait_timeout=wt)
-        elif cmd == "reorder-hand":
-            receipt, state = client.reorder_hand(args.order, wait=wait, wait_timeout=wt)
-        elif cmd == "sell-joker":
-            receipt, state = client.sell_joker(args.index, wait=wait, wait_timeout=wt)
-        elif cmd == "sell-consumable":
-            receipt, state = client.sell_consumable(args.index, wait=wait, wait_timeout=wt)
-        elif cmd == "use":
-            receipt, state = client.use_consumable(args.index, targets=args.targets or None, wait=wait, wait_timeout=wt)
-        elif cmd == "cash-out":
-            receipt, state = client.cash_out(wait=wait, wait_timeout=wt)
-        elif cmd == "buy":
-            receipt, state = client.buy(args.index, use=args.use, wait=wait, wait_timeout=wt)
-        elif cmd == "buy-voucher":
-            receipt, state = client.buy_voucher(args.index, wait=wait, wait_timeout=wt)
-        elif cmd == "buy-pack":
-            receipt, state = client.buy_pack(args.index, wait=wait, wait_timeout=wt)
-        elif cmd == "reroll":
-            receipt, state = client.reroll(wait=wait, wait_timeout=wt)
-        elif cmd == "next-round":
-            receipt, state = client.next_round(wait=wait, wait_timeout=wt)
-        elif cmd == "pick":
-            receipt, state = client.pick(args.index, targets=args.targets or None, wait=wait, wait_timeout=wt)
-        elif cmd == "skip-pack":
-            receipt, state = client.skip_pack(wait=wait, wait_timeout=wt)
-        else:
-            parser.error(f"Unknown command: {cmd}")
+        if cmd == "batch":
+            specs = parse_batch_steps(args.steps)
+            completed, auto_steps, state = client.run_batch(
+                specs,
+                wait_timeout=wt,
+                auto_cash_out=auto_cash_out,
+                auto_select_boss=auto_select_boss,
+            )
+            _print_state_output(
+                state,
+                args.as_json,
+                compact=compact,
+                batch_steps=completed,
+                auto_steps=auto_steps,
+            )
+            return 0
 
-        _print_state_output(state, args.as_json, receipt=receipt)
+        action_name, params = _namespace_to_action_spec(args)
+        receipt, state = client.perform_action(
+            action_name,
+            params,
+            wait=wait,
+            wait_timeout=wt,
+            auto_cash_out=auto_cash_out,
+            auto_select_boss=auto_select_boss,
+        )
+        auto_steps = receipt.get("auto_steps")
+        _print_state_output(
+            state,
+            args.as_json,
+            compact=compact,
+            receipt=receipt,
+            auto_steps=auto_steps,
+        )
         return 0
+    except BalatroBatchError as exc:
+        if args.as_json:
+            err_out: dict[str, Any] = {
+                "error": str(exc),
+                "failed_index": exc.failed_index,
+                "failed_action": exc.action_name,
+                "completed_steps": exc.completed,
+            }
+            if exc.last_state is not None:
+                err_out["state"] = exc.last_state
+                err_out["legal_actions"] = compute_legal_actions(exc.last_state)
+            print(json.dumps(err_out, ensure_ascii=False, indent=2))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+            if exc.completed:
+                done = " -> ".join(str(s.get("action")) for s in exc.completed)
+                print(f"Completed before failure: {done}", file=sys.stderr)
+            if exc.last_state is not None:
+                print(format_state(exc.last_state, compact=compact))
+        return 1
     except BalatroError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

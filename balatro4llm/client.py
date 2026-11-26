@@ -3,8 +3,10 @@
 Provides:
 - Low-level NDJSON/TCP transport (`ping`, `get_state`, `execute_action`)
 - Post-action stability wait loop (`wait_until_stable`) polling G.E_MANAGER / locks / state readiness
+- Optional auto-advancement of mandatory zero-choice transitions (`auto_cash_out`, `auto_select_boss`)
+- Deterministic sequential batch execution (`run_batch`) with fail-fast state reporting
 - High-level game action methods (reusable by both CLI and future MCP server)
-- Legal-action inference and compact LLM-friendly state formatting
+- Legal-action inference and normal / `--compact` LLM-friendly state formatting
 """
 
 from __future__ import annotations
@@ -19,6 +21,15 @@ from typing import Any, Sequence
 
 DEFAULT_HOST = os.environ.get("BALATRO4LLM_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("BALATRO4LLM_PORT", "12345"))
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+DEFAULT_COMPACT = _env_flag("BALATRO4LLM_COMPACT")
+DEFAULT_AUTO_CASH_OUT = _env_flag("BALATRO4LLM_AUTO_CASH_OUT")
+DEFAULT_AUTO_ADVANCE = _env_flag("BALATRO4LLM_AUTO_ADVANCE")
 
 PACK_STATES = frozenset({
     "TAROT_PACK",
@@ -35,6 +46,8 @@ TRANSIENT_STATES = frozenset({
     "PLAY_TAROT",
     "SPLASH",
 })
+
+RANK_ORDER = ("A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2")
 
 
 class BalatroError(Exception):
@@ -60,6 +73,25 @@ class BalatroTimeoutError(BalatroError):
 
     def __init__(self, message: str, last_state: dict[str, Any] | None = None) -> None:
         super().__init__(message)
+        self.last_state = last_state
+
+
+class BalatroBatchError(BalatroError):
+    """Raised when a step inside `run_batch` fails; preserves completed receipts and live state."""
+
+    def __init__(
+        self,
+        failed_index: int,
+        action_name: str,
+        message: str,
+        completed: list[dict[str, Any]],
+        last_state: dict[str, Any] | None,
+    ) -> None:
+        super().__init__(f"Batch failed at step #{failed_index} ({action_name}): {message}")
+        self.failed_index = failed_index
+        self.action_name = action_name
+        self.reason = message
+        self.completed = completed
         self.last_state = last_state
 
 
@@ -115,7 +147,6 @@ def is_state_stable(state: dict[str, Any]) -> bool:
     if state_name in PACK_STATES:
         if not ready.get("pack_ready"):
             return False
-        # Arcana & Spectral packs also draw hand cards before interaction.
         if state_name in ("TAROT_PACK", "SPECTRAL_PACK"):
             hand = state.get("hand") or {}
             deck = state.get("deck") or {}
@@ -217,7 +248,7 @@ class BalatroClient:
             time.sleep(initial_delay)
 
         streak = 0
-        last_key: tuple[Any, Any, int] | None = None
+        last_key: tuple[Any, ...] | None = None
         last_state: dict[str, Any] | None = None
 
         while True:
@@ -262,6 +293,49 @@ class BalatroClient:
                 )
             time.sleep(poll_interval)
 
+    def auto_advance_state(
+        self,
+        state: dict[str, Any],
+        *,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
+        wait_timeout: float = 30.0,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Automatically advance trivial zero-choice states (ROUND_EVAL cash-out / mandatory Boss select)."""
+        steps: list[dict[str, Any]] = []
+        if not auto_cash_out and not auto_select_boss:
+            return steps, state
+
+        for _ in range(3):
+            ready = state.get("ready") or {}
+            if ready.get("has_overlay_menu") or ready.get("in_tutorial"):
+                break
+            state_name = state.get("state_name")
+
+            if auto_cash_out and state_name == "ROUND_EVAL" and ready.get("round_eval_ready"):
+                receipt = self.execute_action("cash_out", {})
+                steps.append(receipt)
+                state = self.wait_until_stable(timeout=wait_timeout, initial_delay=0.15)
+                continue
+
+            if auto_select_boss and state_name == "BLIND_SELECT" and ready.get("blind_select_ready"):
+                blind = state.get("blind") or {}
+                if blind.get("on_deck") == "Boss" and not blind.get("can_reroll_boss"):
+                    receipt = self.execute_action("select_blind", {})
+                    steps.append(receipt)
+                    state = self.wait_until_stable(timeout=wait_timeout, initial_delay=0.15)
+                    continue
+
+            break
+
+        return steps, state
+
+    def _wait_after_action(self, name: str, wait_timeout: float) -> dict[str, Any]:
+        if name in ("sort_hand", "reorder_jokers", "reorder_hand"):
+            return self.wait_until_stable(timeout=wait_timeout, initial_delay=0.05, required_streak=1)
+        init_delay = 0.35 if name in ("start", "continue", "main_menu") else 0.15
+        return self.wait_until_stable(timeout=wait_timeout, initial_delay=init_delay)
+
     def perform_action(
         self,
         name: str,
@@ -269,18 +343,67 @@ class BalatroClient:
         *,
         wait: bool = True,
         wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Execute an atomic action, optionally wait until animations finish, and return (receipt, state)."""
+        """Execute an atomic action, optionally wait + auto-advance, and return (receipt, state)."""
         receipt = self.execute_action(name, params)
         if wait:
-            if name in ("sort_hand", "reorder_jokers", "reorder_hand"):
-                state = self.wait_until_stable(timeout=wait_timeout, initial_delay=0.05, required_streak=1)
-            else:
-                init_delay = 0.35 if name in ("start", "continue", "main_menu") else 0.15
-                state = self.wait_until_stable(timeout=wait_timeout, initial_delay=init_delay)
+            state = self._wait_after_action(name, wait_timeout)
+            auto_steps, state = self.auto_advance_state(
+                state,
+                auto_cash_out=auto_cash_out,
+                auto_select_boss=auto_select_boss,
+                wait_timeout=wait_timeout,
+            )
+            if auto_steps:
+                receipt = dict(receipt)
+                receipt["auto_steps"] = auto_steps
         else:
             state = self.get_state()
         return receipt, state
+
+    def run_batch(
+        self,
+        steps: Sequence[tuple[str, dict[str, Any]]],
+        *,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        """Execute a deterministic sequence of actions, waiting until stable after each step.
+
+        Fail-fast: if any step fails, immediately fetches current state and raises BalatroBatchError.
+        Returns (completed_receipts, auto_steps, final_state).
+        """
+        if not steps:
+            raise BalatroError("Batch must contain at least one action step.")
+
+        completed: list[dict[str, Any]] = []
+        state: dict[str, Any] | None = None
+
+        for idx, (action_name, params) in enumerate(steps, start=1):
+            try:
+                receipt = self.execute_action(action_name, params)
+                state = self._wait_after_action(action_name, wait_timeout)
+                completed.append(receipt)
+            except BalatroError as exc:
+                live_state = getattr(exc, "last_state", None)
+                if live_state is None:
+                    try:
+                        live_state = self.get_state()
+                    except BalatroError:
+                        live_state = state
+                raise BalatroBatchError(idx, action_name, str(exc), completed, live_state) from exc
+
+        assert state is not None
+        auto_steps, state = self.auto_advance_state(
+            state,
+            auto_cash_out=auto_cash_out,
+            auto_select_boss=auto_select_boss,
+            wait_timeout=wait_timeout,
+        )
+        return completed, auto_steps, state
 
     # --- High-level action methods (shared by CLI and future MCP server) ---
 
@@ -292,18 +415,31 @@ class BalatroClient:
         seed: str | None = None,
         wait: bool = True,
         wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         params: dict[str, Any] = {"stake": stake}
         if deck:
             params["deck"] = deck
         if seed:
             params["seed"] = seed
-        return self.perform_action("start", params, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "start", params, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def continue_run(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("continue", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "continue", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def go_to_menu(
         self, *, wait: bool = True, wait_timeout: float = 30.0
@@ -311,9 +447,17 @@ class BalatroClient:
         return self.perform_action("main_menu", {}, wait=wait, wait_timeout=wait_timeout)
 
     def dismiss_overlay(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("dismiss_overlay", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "dismiss_overlay", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def select_blind(
         self, *, wait: bool = True, wait_timeout: float = 30.0
@@ -321,9 +465,17 @@ class BalatroClient:
         return self.perform_action("select_blind", {}, wait=wait, wait_timeout=wait_timeout)
 
     def skip_blind(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("skip_blind", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "skip_blind", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def reroll_boss(
         self, *, wait: bool = True, wait_timeout: float = 30.0
@@ -331,9 +483,18 @@ class BalatroClient:
         return self.perform_action("reroll_boss", {}, wait=wait, wait_timeout=wait_timeout)
 
     def play(
-        self, cards: Sequence[int], *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        cards: Sequence[int],
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("play", {"cards": list(cards)}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "play", {"cards": list(cards)}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def discard(
         self, cards: Sequence[int], *, wait: bool = True, wait_timeout: float = 30.0
@@ -372,21 +533,44 @@ class BalatroClient:
         *,
         wait: bool = True,
         wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         params: dict[str, Any] = {"index": index}
         if targets:
             params["targets"] = list(targets)
-        return self.perform_action("use", params, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "use", params, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def cash_out(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("cash_out", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "cash_out", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def buy(
-        self, index: int, *, use: bool = False, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        index: int,
+        *,
+        use: bool = False,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("buy", {"index": index, "use": use}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "buy", {"index": index, "use": use}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def buy_voucher(
         self, index: int = 1, *, wait: bool = True, wait_timeout: float = 30.0
@@ -404,9 +588,17 @@ class BalatroClient:
         return self.perform_action("reroll", {}, wait=wait, wait_timeout=wait_timeout)
 
     def next_round(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("next_round", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "next_round", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def pick(
         self,
@@ -415,21 +607,38 @@ class BalatroClient:
         *,
         wait: bool = True,
         wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         params: dict[str, Any] = {"index": index}
         if targets:
             params["targets"] = list(targets)
-        return self.perform_action("pick", params, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "pick", params, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
     def skip_pack(
-        self, *, wait: bool = True, wait_timeout: float = 30.0
+        self,
+        *,
+        wait: bool = True,
+        wait_timeout: float = 30.0,
+        auto_cash_out: bool = False,
+        auto_select_boss: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self.perform_action("skip_pack", {}, wait=wait, wait_timeout=wait_timeout)
+        return self.perform_action(
+            "skip_pack", {}, wait=wait, wait_timeout=wait_timeout,
+            auto_cash_out=auto_cash_out, auto_select_boss=auto_select_boss,
+        )
 
 
-def _display_name(item: dict[str, Any]) -> str:
+def _display_name(item: dict[str, Any], *, compact: bool = False) -> str:
     name = str(item.get("name") or "")
     loc = str(item.get("loc_name") or "")
+    if compact:
+        if loc and loc != "ERROR":
+            return loc
+        return name or "?"
     if loc and loc != name and loc != "ERROR":
         return f"{loc} ({name})"
     return name or loc or "?"
@@ -443,6 +652,37 @@ def _format_num(value: Any) -> str:
     if isinstance(value, int):
         return f"{value:,}"
     return str(value)
+
+
+def format_deck_composition(deck: dict[str, Any] | None) -> str | None:
+    """Format remaining draw-pile composition into a single compact ~35-token line."""
+    if not deck or not isinstance(deck.get("composition"), dict):
+        return None
+    comp = deck["composition"]
+    suits = comp.get("suits") or {}
+    ranks = comp.get("ranks") or {}
+    special = comp.get("special") or []
+
+    rem = int(deck.get("remaining", 0))
+    tot = int(deck.get("total", 0))
+    prefix = f"Deck Left ({rem})" if rem < tot else f"Deck ({rem})"
+
+    suit_parts = [f"{s}:{suits.get(s, 0)}" for s in ("S", "H", "C", "D")]
+    if suits.get("Stone", 0):
+        suit_parts.append(f"Stone:{suits['Stone']}")
+
+    rank_parts = [f"{r}:{ranks[r]}" for r in RANK_ORDER if ranks.get(r, 0) > 0]
+
+    segments = [f"{prefix}: {' '.join(suit_parts)}"]
+    if rank_parts:
+        segments.append(" ".join(rank_parts))
+    if special:
+        spec_parts = [
+            f"{sp['label']}x{sp['count']}" if sp.get("count", 1) > 1 else str(sp["label"])
+            for sp in special
+        ]
+        segments.append("Special: " + ", ".join(spec_parts))
+    return " | ".join(segments)
 
 
 def _format_playing_card(card: dict[str, Any]) -> str:
@@ -476,16 +716,43 @@ def _format_playing_card(card: dict[str, Any]) -> str:
     return f"[{idx}] {short}{suffix}"
 
 
-def _format_item_card(card: dict[str, Any], *, show_price: bool = False, show_sell: bool = False) -> str:
+def _format_joker_inline_compact(card: dict[str, Any]) -> str:
+    idx = card.get("index", "?")
+    title = _display_name(card, compact=True)
+    tags: list[str] = []
+    if card.get("compact_stats"):
+        tags.append(str(card["compact_stats"]))
+    if card.get("edition"):
+        tags.append(str(card["edition"]))
+    if card.get("debuff"):
+        tags.append("DEBUFF")
+    if card.get("eternal"):
+        tags.append("Eternal")
+    if card.get("perishable"):
+        tally = card.get("perish_tally")
+        tags.append(f"Perish:{tally}" if tally is not None else "Perish")
+    if card.get("rental"):
+        tags.append("Rental")
+    suffix = f"({','.join(tags)})" if tags else ""
+    return f"[{idx}]{title}{suffix}"
+
+
+def _format_item_card(
+    card: dict[str, Any],
+    *,
+    show_price: bool = False,
+    show_sell: bool = False,
+    compact: bool = False,
+) -> str:
     idx = card.get("index", "?")
     if card.get("kind") == "PlayingCard":
         base = _format_playing_card(card)
         if show_price:
-            afford = "" if card.get("can_buy", True) else " [cannot afford]"
+            afford = "" if card.get("can_buy", True) else " [no $]"
             return f"{base} - ${card.get('cost', 0)}{afford}"
         return base
 
-    title = _display_name(card)
+    title = _display_name(card, compact=compact)
     tags: list[str] = []
     if card.get("kind") and card.get("kind") not in ("Joker", "Voucher", "Booster"):
         tags.append(str(card["kind"]))
@@ -515,22 +782,35 @@ def _format_item_card(card: dict[str, Any], *, show_price: bool = False, show_se
             use_str = "usable"
         elif card.get("can_use_with_targets") and max_h:
             if min_h == max_h:
-                use_str = f"usable (select {max_h} hand card{'s' if max_h > 1 else ''})"
+                use_str = f"usable (select {max_h})" if compact else f"usable (select {max_h} hand card{'s' if max_h > 1 else ''})"
             else:
-                use_str = f"usable (select {min_h}..{max_h} hand cards)"
+                use_str = f"usable (select {min_h}..{max_h})" if compact else f"usable (select {min_h}..{max_h} hand cards)"
         else:
             use_str = "not-usable"
             if max_h:
                 if min_h == max_h:
-                    use_str += f" (needs {max_h} hand card{'s' if max_h > 1 else ''})"
+                    use_str += f" (needs {max_h})" if compact else f" (needs {max_h} hand card{'s' if max_h > 1 else ''})"
                 else:
-                    use_str += f" (needs {min_h}..{max_h} hand cards)"
+                    use_str += f" (needs {min_h}..{max_h})" if compact else f" (needs {min_h}..{max_h} hand cards)"
         tags.append(use_str)
 
     tag_str = f" [{', '.join(tags)}]" if tags else ""
     desc = card.get("description")
     desc_str = f" — {desc}" if desc else ""
     return f"[{idx}] {title}{tag_str}{desc_str}"
+
+
+def format_auto_steps(auto_steps: Sequence[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for st in auto_steps:
+        act = st.get("action")
+        if act == "cash_out":
+            parts.append(f"cash-out (+${st.get('dollars', 0)})")
+        elif act == "select_blind":
+            parts.append(f"select-blind ({st.get('slot', 'Boss')})")
+        else:
+            parts.append(str(act))
+    return "[auto] " + " -> ".join(parts)
 
 
 def compute_legal_actions(state: dict[str, Any]) -> list[str]:
@@ -621,7 +901,6 @@ def compute_legal_actions(state: dict[str, Any]) -> list[str]:
     else:
         return [f"wait (transient state: {state_name})"]
 
-    # Always-available inventory actions in stable RUN states
     if state_name in ("SELECTING_HAND", "SHOP", "BLIND_SELECT") or state_name in PACK_STATES:
         jokers = (state.get("jokers") or {}).get("cards") or []
         if any(j.get("can_sell") for j in jokers):
@@ -637,9 +916,22 @@ def compute_legal_actions(state: dict[str, Any]) -> list[str]:
     return actions
 
 
-def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
-    """Format a state snapshot into concise, LLM-friendly text."""
+def format_state(
+    state: dict[str, Any],
+    *,
+    show_hands: bool = False,
+    compact: bool = False,
+    auto_steps: Sequence[dict[str, Any]] | None = None,
+    batch_steps: Sequence[dict[str, Any]] | None = None,
+) -> str:
+    """Format a state snapshot into concise, LLM-friendly text (normal or --compact)."""
     lines: list[str] = []
+    if batch_steps:
+        bnames = [str(s.get("action", "?")) for s in batch_steps]
+        lines.append(f"[batch] executed {len(bnames)} steps: {' -> '.join(bnames)}")
+    if auto_steps:
+        lines.append(format_auto_steps(auto_steps))
+
     stage_name = state.get("stage_name") or str(state.get("stage"))
     state_name = state.get("state_name") or str(state.get("state"))
     ready = state.get("ready") or {}
@@ -666,10 +958,10 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
         menu = state.get("menu") or {}
         sel = menu.get("selected_deck") or {}
         lines.append(f"Profile: {menu.get('profile')} | Saved Run: {menu.get('has_saved_run')}")
-        lines.append(f"Selected Deck: {_display_name(sel)} [{sel.get('key')}]")
+        lines.append(f"Selected Deck: {_display_name(sel, compact=compact)} [{sel.get('key')}]")
         decks = menu.get("unlocked_decks") or []
         if decks:
-            deck_str = ", ".join(f"{d.get('key')}({_display_name(d)})" for d in decks)
+            deck_str = ", ".join(f"{d.get('key')}({_display_name(d, compact=compact)})" for d in decks)
             lines.append(f"Unlocked Decks ({len(decks)}): {deck_str}")
         lines.append("Legal Actions: " + " | ".join(compute_legal_actions(state)))
         return "\n".join(lines)
@@ -680,38 +972,51 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
 
     if run:
         dk = run.get("deck") or {}
-        lines.append(
-            f"Ante {run.get('ante')}/{run.get('win_ante')} | Round {run.get('round')} | "
-            f"${run.get('dollars', 0)} (min ${run.get('bankrupt_at', 0)}) | "
-            f"Hands: {run.get('hands_left')} | Discards: {run.get('discards_left')} | "
-            f"Deck: {deck.get('remaining', 0)}/{deck.get('total', 0)} "
-            f"[{_display_name(dk)}, {run.get('stake_name')}]"
-        )
+        bankrupt_at = run.get("bankrupt_at", 0)
+        money_str = f"${run.get('dollars', 0)}"
+        if not compact or bankrupt_at != 0:
+            money_str += f" (min ${bankrupt_at})"
+        if compact:
+            lines.append(
+                f"Ante {run.get('ante')}/{run.get('win_ante')} R{run.get('round')} | "
+                f"{money_str} | Hands:{run.get('hands_left')} Discards:{run.get('discards_left')} | "
+                f"Deck:{deck.get('remaining', 0)}/{deck.get('total', 0)} [{_display_name(dk, compact=True)}]"
+            )
+        else:
+            lines.append(
+                f"Ante {run.get('ante')}/{run.get('win_ante')} | Round {run.get('round')} | "
+                f"{money_str} | Hands: {run.get('hands_left')} | Discards: {run.get('discards_left')} | "
+                f"Deck: {deck.get('remaining', 0)}/{deck.get('total', 0)} "
+                f"[{_display_name(dk)}, {run.get('stake_name')}]"
+            )
 
     active_blind = blind.get("active")
     if active_blind and state_name in ("SELECTING_HAND", "HAND_PLAYED", "DRAW_TO_HAND", "NEW_ROUND", "ROUND_EVAL", "GAME_OVER"):
-        bname = _display_name(active_blind)
+        bname = _display_name(active_blind, compact=compact)
         status = " [DISABLED]" if active_blind.get("disabled") else ""
         debuff = f" — {active_blind['debuff_text']}" if active_blind.get("debuff_text") else ""
         lines.append(
             f"Blind: {bname}{status} | Score: {_format_num(run.get('chips', 0))} / "
             f"{_format_num(active_blind.get('chips', 0))} (Reward ${active_blind.get('dollars', 0)}){debuff}"
         )
+        played_eye = active_blind.get("played_hands") or []
+        if played_eye:
+            lines.append("  Already Played (The Eye - banned): " + ", ".join(played_eye))
 
     if state_name == "BLIND_SELECT":
         lines.append(f"\nBlind Select (Next: {blind.get('on_deck')}):")
         for ch in blind.get("choices") or []:
             marker = ">>" if ch.get("status") == "Select" else "  "
-            bname = _display_name(ch)
+            bname = _display_name(ch, compact=compact)
             extra = f" | Effect: {ch['debuff_text']}" if ch.get("debuff_text") else ""
             tag = ch.get("skip_tag")
             tag_str = ""
             if tag:
                 tdesc = f" — {tag['description']}" if tag.get("description") else ""
-                tag_str = f" | Skip Tag: {_display_name(tag)}{tdesc}"
+                tag_str = f" | Skip: {_display_name(tag, compact=compact)}{tdesc}"
             lines.append(
                 f"  {marker} [{ch.get('slot')}] {bname} ({ch.get('status')}) — "
-                f"Target {_format_num(ch.get('chips', 0))}, Reward ${ch.get('dollars', 0)}{extra}{tag_str}"
+                f"Target {_format_num(ch.get('chips', 0))}, ${ch.get('dollars', 0)}{extra}{tag_str}"
             )
 
     if state_name == "ROUND_EVAL":
@@ -723,30 +1028,43 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
     jokers_obj = state.get("jokers")
     if jokers_obj is not None:
         jcards = jokers_obj.get("cards") or []
-        lines.append(f"\nJokers ({len(jcards)}/{jokers_obj.get('limit', 0)}):")
-        if jcards:
-            for c in jcards:
-                lines.append("  " + _format_item_card(c, show_sell=True))
+        in_hand_focus = state_name in ("SELECTING_HAND", "TAROT_PACK", "SPECTRAL_PACK")
+        if compact and in_hand_focus:
+            if jcards:
+                inline = " | ".join(_format_joker_inline_compact(c) for c in jcards)
+                lines.append(f"Jokers ({len(jcards)}/{jokers_obj.get('limit', 0)}): {inline}")
+            else:
+                lines.append(f"Jokers (0/{jokers_obj.get('limit', 0)}): (none)")
         else:
-            lines.append("  (none)")
+            lines.append(f"\nJokers ({len(jcards)}/{jokers_obj.get('limit', 0)}):")
+            if jcards:
+                for c in jcards:
+                    lines.append("  " + _format_item_card(c, show_sell=True, compact=compact))
+            else:
+                lines.append("  (none)")
 
     # Consumables
     cons_obj = state.get("consumeables")
     if cons_obj is not None:
         ccards = cons_obj.get("cards") or []
-        lines.append(f"\nConsumables ({len(ccards)}/{cons_obj.get('limit', 0)}):")
-        if ccards:
-            for c in ccards:
-                lines.append("  " + _format_item_card(c, show_sell=True))
+        if compact and not ccards:
+            lines.append(f"Consumables (0/{cons_obj.get('limit', 0)}): (none)")
         else:
-            lines.append("  (none)")
+            prefix = "" if compact else "\n"
+            lines.append(f"{prefix}Consumables ({len(ccards)}/{cons_obj.get('limit', 0)}):")
+            if ccards:
+                for c in ccards:
+                    lines.append("  " + _format_item_card(c, show_sell=not compact, compact=compact))
+            else:
+                lines.append("  (none)")
 
     # Hand
     hand_obj = state.get("hand")
     if hand_obj is not None and (hand_obj.get("cards") or state_name == "SELECTING_HAND"):
         hcards = hand_obj.get("cards") or []
+        prefix = "" if compact else "\n"
         lines.append(
-            f"\nHand ({len(hcards)}/{hand_obj.get('limit', 0)}, sort={hand_obj.get('sort')}):"
+            f"{prefix}Hand ({len(hcards)}/{hand_obj.get('limit', 0)}, sort={hand_obj.get('sort')}):"
         )
         if hcards:
             lines.append("  " + "  ".join(_format_playing_card(c) for c in hcards))
@@ -759,6 +1077,11 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
                 f"  Selected Preview: {preview['hand_name']} {preview.get('hand_level', '')} "
                 f"({preview.get('chips')} x {preview.get('mult')}){warn}"
             )
+
+    # Deck remaining composition (always shown in RUN states where deck is present)
+    deck_line = format_deck_composition(deck)
+    if deck_line and state_name in ("SELECTING_HAND", "BLIND_SELECT", "SHOP", "TAROT_PACK", "SPECTRAL_PACK", "STANDARD_PACK"):
+        lines.append(deck_line)
 
     # Shop
     shop = state.get("shop")
@@ -774,19 +1097,19 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
         lines.append("  Shop Cards:")
         if shop.get("jokers"):
             for c in shop["jokers"]:
-                lines.append("    " + _format_item_card(c, show_price=True))
+                lines.append("    " + _format_item_card(c, show_price=True, compact=compact))
         else:
             lines.append("    (empty)")
         lines.append("  Vouchers:")
         if shop.get("vouchers"):
             for c in shop["vouchers"]:
-                lines.append("    " + _format_item_card(c, show_price=True))
+                lines.append("    " + _format_item_card(c, show_price=True, compact=compact))
         else:
             lines.append("    (empty)")
         lines.append("  Booster Packs:")
         if shop.get("boosters"):
             for c in shop["boosters"]:
-                lines.append("    " + _format_item_card(c, show_price=True))
+                lines.append("    " + _format_item_card(c, show_price=True, compact=compact))
         else:
             lines.append("    (empty)")
 
@@ -800,7 +1123,7 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
         pcards = pack.get("cards") or []
         if pcards:
             for c in pcards:
-                lines.append("  " + _format_item_card(c))
+                lines.append("  " + _format_item_card(c, compact=compact))
         else:
             lines.append("  (empty)")
 
@@ -808,12 +1131,12 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
     vouchers = run.get("vouchers") or []
     tags = run.get("tags") or []
     if vouchers:
-        lines.append("\nOwned Vouchers: " + ", ".join(_display_name(v) for v in vouchers))
+        lines.append("Owned Vouchers: " + ", ".join(_display_name(v, compact=compact) for v in vouchers))
     if tags:
         lines.append(
             "Active Tags: "
             + ", ".join(
-                f"{_display_name(t)} ({t['description']})" if t.get("description") else _display_name(t)
+                f"{_display_name(t, compact=compact)} ({t['description']})" if t.get("description") else _display_name(t, compact=compact)
                 for t in tags
             )
         )
@@ -824,17 +1147,22 @@ def format_state(state: dict[str, Any], *, show_hands: bool = False) -> str:
         if show_hands:
             lines.append("\nPoker Hands:")
             for h in poker_hands:
+                hlabel = h.get("loc_name") if (compact and h.get("loc_name") and h.get("loc_name") != "ERROR") else h["name"]
                 lines.append(
-                    f"  {h['name']:16s} Lv.{h['level']:<2d}  "
+                    f"  {hlabel:16s} Lv.{h['level']:<2d}  "
                     f"{h['chips']:>4} x {h['mult']:<4}  (played: {h['played']})"
                 )
         else:
             leveled = [h for h in poker_hands if (h.get("level") or 1) > 1]
             if leveled:
                 lines.append(
-                    "\nUpgraded Hands: "
-                    + ", ".join(f"{h['name']} Lv.{h['level']} ({h['chips']}x{h['mult']})" for h in leveled)
+                    "Upgraded Hands: "
+                    + ", ".join(
+                        f"{(h.get('loc_name') if compact and h.get('loc_name') else h['name'])} Lv.{h['level']} ({h['chips']}x{h['mult']})"
+                        for h in leveled
+                    )
                 )
 
-    lines.append("\nLegal Actions: " + " | ".join(compute_legal_actions(state)))
+    prefix = "" if compact else "\n"
+    lines.append(f"{prefix}Legal Actions: " + " | ".join(compute_legal_actions(state)))
     return "\n".join(lines)
