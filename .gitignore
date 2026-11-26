@@ -1,0 +1,25 @@
+# Extracted Balatro source & local reference files (never commit game assets/code)
+reference/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs & local scratch
+*.log
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
