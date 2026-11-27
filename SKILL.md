@@ -27,7 +27,7 @@ You control a live Balatro game with zero vision and zero GUI clicks through the
 4. **Every action automatically waits for animations/events (`G.E_MANAGER`) to finish** and returns the fresh stable state.
 5. **All indices are 1-based** (`[1]`, `[2]`, ...) matching the exact numbers printed in the latest state output. Re-read indices after every action that modifies cards.
 6. Prefer **`move-joker <from> <to>`** and **`move-hand <from> <to>`** when moving a single Joker or hand card (instead of computing a full permutation for `reorder-jokers`/`reorder-hand`).
-7. Use **`balatro_batch`** (CLI: `batch`) for deterministic multi-step sequences where all indices are already known. **Never** batch actions that depend on unseen future draws or unseen shop/pack contents.
+7. Use **`balatro_batch`** (CLI: `batch`) for deterministic multi-step sequences where all indices are already known (when buying/selling multiple items from the same row, go **right-to-left / highest index first** so earlier indices do not shift). **Never** batch actions that depend on unseen future draws or unseen shop/pack contents.
 
 ---
 
@@ -87,11 +87,12 @@ balatro_batch(steps=["move-hand 1 2", "pick 2 1 2"])
 
 ## Critical Balatro Mechanics & Agent Strategy
 
-### 1. Joker & Hand Ordering (Multiply AFTER Adding!)
-Jokers and held-in-hand cards trigger **left to right** (`[1]` → `[N]`).
-- Place **+Chips** and **+Mult** jokers on the **left** and **XMult** jokers (`X2`, `X3`, `X4`, Polychrome) on the **right**.
-- For held-in-hand triggers, place flat `+Mult` cards (e.g. Queens for `Shoot the Moon`, lowest card for `Raised Fist`) to the **left** of `Steel` (`X1.5`) cards using `move-hand`.
-- Check `Blueprint` (copies joker immediately to its **right**) and `Brainstorm` (copies joker `[1]` on the far **left**). Live compatibility is shown as `compat` / `INCOMPAT` (and uncopyable jokers show `no-copy` when you own Blueprint/Brainstorm).
+### 1. Trigger Ordering & Copying (Multiply AFTER Adding!)
+Played cards, held-in-hand cards, and Jokers all trigger **left to right** (`[1]` → `[N]`):
+- **Jokers**: Place **+Chips** and **+Mult** on the **left**, and **XMult** (`X2`, `X3`, Polychrome) on the **right** (note: on-card `+Mult`/`XMult` fires during card scoring, *before* held `Steel` and Joker `+Mult`).
+- **Played cards**: Place your highest-value card (`Glass`, `Gold Seal`, `Holo`, `Mult`, on-score `XMult`) in slot **`[1]`** for `Hanging Chad`, and keep flat `+Mult` left of `XMult` via `move-hand`.
+- **Held cards**: Place flat held `+Mult` cards (`Shoot the Moon`, `Raised Fist`) to the **left** of `Steel` (`X1.5`) cards.
+- **Copiers (`Blueprint` / `Brainstorm`)**: `Blueprint` copies right, `Brainstorm` copies `[1]` (`compat`/`INCOMPAT`/`no-copy` shown live). Copy whichever balances triggers × multipliers best—and on a safe lethal hand, move copiers onto `Mime` to multiply `Blue Seal`/`Gold` payouts.
 
 ### 2. Shop Availability Tags
 Shop prices explicitly distinguish why an item cannot be bought as-is:
@@ -104,25 +105,24 @@ Shop prices explicitly distinguish why an item cannot be bought as-is:
 - **`Death` Tarot**: converts the **lower-index (left)** card into a copy of the **higher-index (right)** card. Use `move-hand <target_idx> <dest_idx>` first if the desired copy target currently sits to the left.
 
 ### 4. Deck Composition (`Deck Left`)
-- Always check the `Deck Left (N): S:.. H:.. C:.. D:.. | A:.. K:.. | Special: ...` line before discarding (avoid chasing dead suits/ranks!) and in the Shop (pick Jokers/Planets that match your actual deck composition).
+- Always check `Deck Left (N): S:.. H:.. C:.. D:.. | A:.. K:.. | Special: ...` before discarding (avoid chasing dead suits/ranks!) and in the Shop (pick Jokers, Planets, and suit/rank Tarots that fit your actual deck).
 
 ### 5. Economy, Interest & Survival Spending
-- You earn **+$1 interest per $5 held** at end of round (capped at **$25** = +$5/round unless upgraded by Seed Money / Money Tree). Cast `Temperance` / `The Hermit` *before* spending down cash.
-- **Break the `$25` floor to survive**: Before leaving Shop (especially Ante 3+), check `Next:` / `Boss:` targets against your conservative 4-hand output. If scoring looks tight or you still lack `XMult`, spend below `$25` (reroll, buy Planets/Tarots/Glass/Steel) rather than dying with unspent cash.
+- Earn **+$1 interest per $5 held** (capped at **$25** = +$5/round unless upgraded). Cast `Temperance` / `The Hermit` *before* spending down cash, and sequence `The Fool` *after* high-value Tarots/Planets to chain them.
+- **Break the `$25` floor to survive**: Before leaving Shop (especially Ante 3+), check `Next:` / `Boss:` against your conservative 4-hand output. If tight or missing `XMult`, spend below `$25` (reroll, Planets, Glass/Steel, or cheap buy/sell fuel for `Campfire`) rather than dying rich. Remember only **1 Voucher** spawns per Ante: if `Director's Cut` is not this Ante's Voucher, it cannot appear until next Ante.
 
-### 6. High-Stake & Mid-Game Build Discipline
-- **Slot budget (Ante 3+)**: Converge on **1 Chips + 1 scaling `+Mult` + 2 `XMult`** (at most **1** econ/utility slot). Replace flat early Jokers before the Ante 4–5 scaling cliff.
-- **Prefer small hands on Blue+ Stakes**: With `-1` discard, **Pair / High Card** builds (scaling `+Mult` + Chips + `XMult` + **Blue Seal** planet generation) are far more reliable than brittle 5-card Flushes/Straights and do not fight held-in-hand `Steel`/Queen/King cards for hand space.
-- **No greedy hand-burning**: Only trigger single-card first-hand utilities (`DNA`, `Sixth Sense`) when remaining hands comfortably clear the blind—never lose a round for a slow copy.
-- **Eternal & Skip discipline**: Never buy temporary flat-value `Eternal` Jokers (only Eternals strong enough for Ante 8). Rarely skip blinds on high stakes (each skip costs scaling, Blue Seals, and a shop) unless a Tag like early `Investment Tag (+$25)` clearly outweighs it.
+### 6. High-Stake & Scaling Build Discipline
+- **Ante 1 Boss floor**: Never enter Ante 1 Boss (600) with zero scoring Jokers or gambling on one 5-card draw; secure reliable scoring first, and only skip for `Investment Tag (+$25)` if your current setup clears the Boss.
+- **Let your engine dictate hand type**: Build around the scaling core you find—reliable small hands with held value (`Blue Seal`/`Steel`; put `Steel` onto `Blue Seal` cards to compress slots, and stuff non-matching red/junk cards into `High Card`/`Pair` hands to cycle draws or clear hand for `Blackboard`), or bigger hands backed by deck fixing (`Moon`/`World`/`Death`/`Hanged Man`/`Strength`), hand size, or `Telescope`.
+- **Slot budget & late pivot**: By Ante 3+, converge on **1 Chips + 1 scaling `+Mult` + 2 `XMult`** (≤1 econ/utility slot). Replace flat early Jokers by Ante 4–5; in Ante 7–8 (or Endless), pivot the econ slot into another `XMult`, copier, or retrigger.
+- **Stickers, limits & discipline**: Take `Eternal` only on Ante-8-viable Jokers; treat `Perishable` as temporary bridges; dig with discards rather than burning `Seltzer` hands; skip slow utilities (`DNA`, `Sixth Sense`) when tight. Rarely skip blinds on high stakes unless a Tag beats a shop + scaling (and never skip a Big Blind if playing it rotates a suit/condition away from an upcoming debuff Boss).
 
 ### 7. Boss Blind Traps
-Read `Blind: ... — <Effect>` before every hand:
-- **The Pillar**: Cards played earlier in this Ante are `(DEBUFF)`.
-- **Cerulean Bell**: One card is `(FORCED)` and must be included in `play` / `discard`.
-- **The Eye / The Mouth / The Psychic**: The Eye bans repeating hand types (listed under `Already Played`); The Mouth locks you to one hand type; The Psychic requires playing **all 5 cards**.
-- **Verdant Leaf**: Debuffs all cards until you `sell-joker <idx>`.
-- **Face-down cards (`??`)**: Use `sort-hand rank` vs `sort-hand suit` to deduce hidden cards fairly.
+Read `Blind: ... — <Effect>` before every hand. Neutralize run-killers (`The Plant`, `The Ox`, or key suit/rank debuffs) by grabbing `Director's Cut`/`Retcon` early—and **actually spending the `$10`** rather than protecting `$25` interest—or holding **`Luchador`** (sell **inside** the Boss Blind; buy `Overstock` to boost shop slots when hunting it):
+- **Verdant Leaf / The Pillar**: Keep one sellable non-Eternal Joker entering `Verdant Leaf`; `The Pillar` debuffs cards played earlier in the Ante.
+- **The Serpent / Cerulean Bell**: On `The Serpent` (always draw 3), discard **1 card at a time** for +2 hand size. On `Cerulean Bell`, include `(FORCED)` in `play`/`discard`.
+- **The Eye / The Mouth / The Psychic / The Needle**: `The Eye` bans repeats; `The Mouth` locks one hand type; `The Psychic` requires 5 cards; `The Needle` gives 1 hand (pre-scale before entering).
+- **Face-down cards (`??`)**: Toggle `sort-hand rank` vs `sort-hand suit` **and diff `Deck Left`** (missing ranks/suits) to bracket and pinpoint hidden cards.
 
 ### 8. Error & Timeout Recovery
 - If an action times out during a long animation, call `balatro_state()` (or pass `wait_timeout=60`) before acting again.
