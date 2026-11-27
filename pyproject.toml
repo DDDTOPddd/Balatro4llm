@@ -7,6 +7,7 @@ name = "balatro4llm"
 version = "0.8.0"
 description = "Lua Mod + CLI + MCP Server bridge for AI Agents to play Balatro"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = []
 

@@ -1,5 +1,7 @@
 # Balatro4llm
 
+**English** | [简体中文](README.zh-CN.md)
+
 A zero-vision, zero-GUI-click bridge that lets AI Agents (DeepSeek Harness, Codex, Antigravity, or future MCP clients) play **Balatro** natively via an in-game **Lua Mod (Lovely)** + decoupled **Python Core / CLI**.
 
 ## Architecture
@@ -118,3 +120,7 @@ python -m balatro4llm --json state
 ```
 
 See [SKILL.md](SKILL.md) for the complete AI Agent operating guide.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
